@@ -1,0 +1,19 @@
+[package]
+name = "mod-rust_voice"
+version = "0.1.44"
+edition = "2024"
+license = "MIT"
+description = "Rust Voice: proximity voice chat for Horizon, compatible with Plasmo Voice and Simple Voice Chat"
+
+[dependencies]
+rusty-opus = "1"
+cpal = "0.16"
+num-bigint = "0.4"
+num-integer = "0.1"
+num-traits = "0.2"
+getrandom = "0.2"
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc", "block-padding"] }
+# The launcher points this at the Horizon source it builds the game from. Any other
+# dependency must be a crate and version in Horizon's Cargo.lock.
+horizon-client = { git = "https://github.com/horizon-rust/horizon" }
