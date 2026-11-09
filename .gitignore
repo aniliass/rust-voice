@@ -1,0 +1,5 @@
+build/
+target/
+*.hnmod
+*.minisig
+horizon-mods.key
