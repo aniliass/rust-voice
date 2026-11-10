@@ -27,6 +27,15 @@ static NOTES_ON: AtomicBool = AtomicBool::new(true);
 static HOTBAR_ICON_ON: AtomicBool = AtomicBool::new(true);
 /// Табличка с названием трека над играющей пластинкой.
 static DISC_LABEL_ON: AtomicBool = AtomicBool::new(true);
+static DISC_GLOW_ON: AtomicBool = AtomicBool::new(true);
+static DISC_FOCUS_ON: AtomicBool = AtomicBool::new(true);
+static PIN_SOLO_ON: AtomicBool = AtomicBool::new(false);
+/// От кого показывать приглашения в группу (`InviteMode`).
+static INVITE_MODE: AtomicU8 = AtomicU8::new(0);
+/// От кого приглашения показываем в режиме «только от» (ники в нижнем регистре).
+static INVITE_ALLOW: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// От кого приглашения не показываем (ники в нижнем регистре).
+static INVITE_BLOCK: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// Выбранный микрофон по имени; пусто — системный по умолчанию.
 static MIC_DEVICE: Mutex<String> = Mutex::new(String::new());
 /// Микрофоны, которые нашла система: (значение для конфига, название для меню). Заполняет голосовой поток.
@@ -151,13 +160,14 @@ pub fn ptt_label_for(name: &str) -> String {
 // ---------- клавиши действий ----------
 /// Действия, которым можно назначить клавишу во вкладке «Клавиши»: (имя в конфиге, подпись).
 /// «menu» — открыть меню (без назначения берётся из Options > Mods, по умолчанию M).
-pub const ACTIONS: [(&str, &str); 6] = [
+pub const ACTIONS: [(&str, &str); 7] = [
     ("menu", "Открыть меню"),
     ("mute", "Выключить микрофон"),
     ("deafen", "Выключить голосовой чат"),
     ("occlusion", "Вкл/выкл заглушение"),
     ("dist_up", "Увеличить дистанцию"),
     ("dist_down", "Уменьшить дистанцию"),
+    ("pin_disc", "Закрепить пластинку"),
 ];
 
 pub fn action_binding(action: &str) -> Option<String> {
@@ -488,7 +498,71 @@ pub fn hotbar_icon_on() -> bool { HOTBAR_ICON_ON.load(Relaxed) }
 pub fn set_hotbar_icon_on(v: bool) { HOTBAR_ICON_ON.store(v, Relaxed) }
 pub fn notes_on() -> bool { NOTES_ON.load(Relaxed) }
 pub fn set_notes_on(v: bool) { NOTES_ON.store(v, Relaxed) }
+/// От кого показывать приглашения в группу.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InviteMode {
+    /// От всех, кроме отмеченных (по умолчанию; никто не отмечен — от всех).
+    AllExcept,
+    /// Только от отмеченных.
+    OnlyFrom,
+    /// Ни от кого.
+    Nobody,
+}
+
+pub fn invite_mode() -> InviteMode {
+    match INVITE_MODE.load(Relaxed) {
+        1 => InviteMode::OnlyFrom,
+        2 => InviteMode::Nobody,
+        _ => InviteMode::AllExcept,
+    }
+}
+pub fn set_invite_mode(m: InviteMode) {
+    INVITE_MODE.store(m as u8, Relaxed)
+}
+pub fn invites_on() -> bool { invite_mode() != InviteMode::Nobody }
+
+fn list_of(l: &Mutex<Vec<String>>) -> Vec<String> { l.lock().map(|g| g.clone()).unwrap_or_default() }
+fn list_has(l: &Mutex<Vec<String>>, nick: &str) -> bool {
+    let n = nick.to_lowercase();
+    l.lock().map(|g| g.iter().any(|b| *b == n)).unwrap_or(false)
+}
+fn list_set(l: &Mutex<Vec<String>>, nick: &str, on: bool) {
+    let n = nick.trim().to_lowercase();
+    if n.is_empty() || n.contains(',') {
+        return;
+    }
+    if let Ok(mut g) = l.lock() {
+        g.retain(|b| *b != n);
+        if on {
+            g.push(n);
+        }
+    }
+}
+/// «От всех, кроме»: от кого не показываем.
+pub fn invite_blocked() -> Vec<String> { list_of(&INVITE_BLOCK) }
+pub fn is_invite_blocked(nick: &str) -> bool { list_has(&INVITE_BLOCK, nick) }
+pub fn set_invite_blocked(nick: &str, on: bool) { list_set(&INVITE_BLOCK, nick, on) }
+/// «Только от»: от кого показываем.
+pub fn invite_allowed() -> Vec<String> { list_of(&INVITE_ALLOW) }
+pub fn is_invite_allowed(nick: &str) -> bool { list_has(&INVITE_ALLOW, nick) }
+pub fn set_invite_allowed(nick: &str, on: bool) { list_set(&INVITE_ALLOW, nick, on) }
+
+/// Показать ли приглашение от `from` (None — ник не узнали).
+pub fn invite_accepted(from: Option<&str>) -> bool {
+    match invite_mode() {
+        InviteMode::Nobody => false,
+        InviteMode::AllExcept => !from.is_some_and(is_invite_blocked),
+        InviteMode::OnlyFrom => from.is_some_and(is_invite_allowed),
+    }
+}
 pub fn disc_label_on() -> bool { DISC_LABEL_ON.load(Relaxed) }
+pub fn disc_glow_on() -> bool { DISC_GLOW_ON.load(Relaxed) }
+pub fn set_disc_glow_on(v: bool) { DISC_GLOW_ON.store(v, Relaxed) }
+pub fn disc_focus_on() -> bool { DISC_FOCUS_ON.load(Relaxed) }
+pub fn set_disc_focus_on(v: bool) { DISC_FOCUS_ON.store(v, Relaxed) }
+/// При закреплённой пластинке остальные совсем не слышны (иначе — тихо фоном).
+pub fn pin_solo_on() -> bool { PIN_SOLO_ON.load(Relaxed) }
+pub fn set_pin_solo_on(v: bool) { PIN_SOLO_ON.store(v, Relaxed) }
 pub fn set_disc_label_on(v: bool) { DISC_LABEL_ON.store(v, Relaxed) }
 pub fn set_nametags_on(v: bool) { NAMETAGS_ON.store(v, Relaxed) }
 pub fn overlay_on() -> bool { OVERLAY_ON.load(Relaxed) }
@@ -818,6 +892,12 @@ pub fn save() {
     text.push_str(&format!("notes={}\n", notes_on()));
     text.push_str(&format!("hotbar_icon={}\n", hotbar_icon_on()));
     text.push_str(&format!("disc_label={}\n", disc_label_on()));
+    text.push_str(&format!("disc_glow={}\n", disc_glow_on()));
+    text.push_str(&format!("disc_focus={}\n", disc_focus_on()));
+    text.push_str(&format!("pin_solo={}\n", pin_solo_on()));
+    text.push_str(&format!("invite_mode={}\n", invite_mode() as u8));
+    text.push_str(&format!("invite_allow={}\n", invite_allowed().join(",")));
+    text.push_str(&format!("invite_block={}\n", invite_blocked().join(",")));
     text.push_str(&format!("group_corner={}\n", group_corner()));
     text.push_str(&format!("lang={}\n", crate::i18n::pref_key(crate::i18n::pref())));
     for slot in 0..PTT_SLOTS {
@@ -879,6 +959,25 @@ pub fn load() {
                 "notes" => set_notes_on(v != "false"),
                 "hotbar_icon" => set_hotbar_icon_on(v != "false"),
                 "disc_label" => set_disc_label_on(v != "false"),
+                "disc_glow" => set_disc_glow_on(v != "false"),
+                "disc_focus" => set_disc_focus_on(v != "false"),
+                "pin_solo" => set_pin_solo_on(v == "true"),
+                "invites" if v == "false" => set_invite_mode(InviteMode::Nobody),
+                "invite_mode" => set_invite_mode(match v {
+                    "1" => InviteMode::OnlyFrom,
+                    "2" => InviteMode::Nobody,
+                    _ => InviteMode::AllExcept,
+                }),
+                "invite_allow" => {
+                    for n in v.split(',') {
+                        set_invite_allowed(n, true);
+                    }
+                }
+                "invite_block" => {
+                    for n in v.split(',') {
+                        set_invite_blocked(n, true);
+                    }
+                }
                 "noise" => {
                     if let Ok(t) = v.parse::<u32>() {
                         set_noise_pct(t)

@@ -190,7 +190,7 @@ impl<'a> Reader<'a> {
     }
     pub fn utf(&mut self) -> Option<String> {
         let n = u16::from_be_bytes(self.bytes(2)?.try_into().ok()?) as usize;
-        String::from_utf8(self.bytes(n)?.to_vec()).ok()
+        Some(java_utf(self.bytes(n)?))
     }
 }
 
@@ -505,6 +505,39 @@ fn udp_header(out: &mut Vec<u8>, ty: u8, secret: &[u8; 16], now_ms: u64) {
     out.extend_from_slice(&(now_ms as i64).to_be_bytes());
 }
 
+/// Строка Java `writeUTF` (modified UTF-8): эмодзи и прочее вне BMP там — пара суррогатов по 3 байта,
+/// а NUL — `C0 80`. Обычный UTF-8 такое не принимает, и из-за одного 🐰 в названии пластинки
+/// терялся весь пакет. Склеиваем пары; что не разобрать — заменяем на «�», но строку не теряем.
+pub fn java_utf(b: &[u8]) -> String {
+    if let Ok(s) = std::str::from_utf8(b) {
+        return s.to_string();
+    }
+    let mut units: Vec<u16> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        let (u, n) = if c < 0x80 {
+            (c as u16, 1)
+        } else if c & 0xE0 == 0xC0 && i + 1 < b.len() {
+            ((((c & 0x1F) as u16) << 6) | (b[i + 1] & 0x3F) as u16, 2)
+        } else if c & 0xF0 == 0xE0 && i + 2 < b.len() {
+            ((((c & 0x0F) as u16) << 12) | (((b[i + 1] & 0x3F) as u16) << 6) | (b[i + 2] & 0x3F) as u16, 3)
+        } else if c & 0xF8 == 0xF0 && i + 3 < b.len() {
+            // настоящий 4-байтный UTF-8 вперемешку: раскладываем на пару
+            let cp = (((c & 0x07) as u32) << 18) | (((b[i + 1] & 0x3F) as u32) << 12) | (((b[i + 2] & 0x3F) as u32) << 6) | (b[i + 3] & 0x3F) as u32;
+            let mut buf = [0u16; 2];
+            units.extend_from_slice(char::from_u32(cp).unwrap_or('\u{FFFD}').encode_utf16(&mut buf));
+            i += 4;
+            continue;
+        } else {
+            (0xFFFD, 1)
+        };
+        units.push(u);
+        i += n;
+    }
+    String::from_utf16_lossy(&units)
+}
+
 /// UDP PlayerAudioPacket: seq, данные (уже зашифрованные), activationId, дистанция, stereo.
 pub fn udp_player_audio(
     secret: &[u8; 16],
@@ -599,6 +632,16 @@ mod tests {
         assert_eq!(b[0] as usize, "minecraft:register".len());
         assert_eq!(&b[1..19], "minecraft:register".as_bytes());
         assert_eq!(&b[19..], [1, 2, 3]);
+    }
+
+    #[test]
+    fn java_utf_reads_emoji_and_nul() {
+        // 🐰 = U+1F430 = D83D DC30 → ED A0 BD ED B0 B0
+        assert_eq!(java_utf(&[b'H', b'i', 0xED, 0xA0, 0xBD, 0xED, 0xB0, 0xB0]), "Hi🐰");
+        assert_eq!(java_utf(&[b'a', 0xC0, 0x80, b'b']), "a\0b");
+        assert_eq!(java_utf("Жми ♥ 🐰".as_bytes()), "Жми ♥ 🐰");
+        let mut r = Reader::new(&[0, 6, 0xED, 0xA0, 0xBD, 0xED, 0xB0, 0xB0]);
+        assert_eq!(r.utf().as_deref(), Some("🐰"));
     }
 
     #[test]

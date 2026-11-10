@@ -4,6 +4,8 @@ Proximity voice chat for [Horizon](https://playhorizon.dev), the Rust rewrite of
 
 **A native Horizon mod**: the launcher compiles it into the game. Native mods are not sandboxed and run with your account's rights, so read the source before you build it.
 
+![The Rust Voice menu: per-source and per-player volume](docs/screenshots/menu-volume.png)
+
 ## What it does
 
 - **Two protocols in one mod.** On joining a server it asks for Plasmo Voice (v2) and Simple Voice Chat (2.6 and 2.7, compatibility 20 and 21) and uses whichever the server answers. On Horizon servers it also talks to Horizon's own voicechat-server (Simple Voice Chat 2.6 over Horizon's mod messages). The Advanced tab shows which one is in use.

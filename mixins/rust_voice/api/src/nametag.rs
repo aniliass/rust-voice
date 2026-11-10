@@ -107,6 +107,12 @@ pub fn look_ray(host: &dyn Host) -> Option<([f64; 3], [f64; 3])> {
     Some((cam.pos, forward_of(&cam.view)))
 }
 
+/// Куда смотрит эта камера (единичный вектор). Камера — та, из которой рисуется кадр: в F5 она позади
+/// или перед игроком, и «за спиной» считается от неё.
+pub fn forward(cam: &Cam) -> [f64; 3] {
+    forward_of(&cam.view)
+}
+
 fn forward_of(view: &[f32; 16]) -> [f64; 3] {
     let (a, b, c) = if ROW_MAJOR { (view[8], view[9], view[10]) } else { (view[2], view[6], view[10]) };
     let f = [-(a as f64), -(b as f64), -(c as f64)];

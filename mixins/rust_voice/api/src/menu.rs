@@ -21,6 +21,9 @@ pub trait Canvas {
     /// Голова игрока (лицо 8×8 и второй слой из скина) в квадрате `size`×`size`. `skin` — имя текстуры скина.
     /// Холст без картинок ничего не рисует, и меню тогда ставит заглушку.
     fn face(&mut self, _skin: &str, _x: i32, _y: i32, _size: i32) {}
+    /// Часть той же головы: строки скина `from..from+rows` (из 8), с `y` — для строк списка, обрезанных
+    /// краем (картинку иначе не обрезать: у холста нет «ножниц»).
+    fn face_part(&mut self, _skin: &str, _x: i32, _y: i32, _size: i32, _from: i32, _rows: i32) {}
 }
 
 // ---------- цвета (ванильная палитра: серые кнопки, чёрные рамки, белый текст; один фирменный акцент) ----------
@@ -180,6 +183,9 @@ struct State {
     /// Тип новой группы SVC (по умолчанию «обычная»: «Группы» — группе, «Локальный» — только рядом).
     group_kind: crate::svc::GroupKind,
     join_pass: String,
+    /// Строки поиска вкладки «Группы»: группы и игроки, кого позвать.
+    group_find: String,
+    invite_find: String,
     join_id: Option<String>,
     /// Громкость до «выключить» у кнопки с динамиком: (ключ, проценты). Ключ — ник или `\0local`/`\0group`.
     muted_prev: Vec<(String, u32)>,
@@ -219,6 +225,8 @@ static ST: Mutex<State> = Mutex::new(State {
     group_pass: String::new(),
     group_kind: crate::svc::GroupKind::Normal,
     join_pass: String::new(),
+    group_find: String::new(),
+    invite_find: String::new(),
     join_id: None,
     muted_prev: Vec::new(),
     open_t: 0.0,
@@ -365,7 +373,14 @@ enum GroupField {
     Pass,
     /// Пароль для входа в группу `join_id`.
     Join,
+    /// Поиск группы (по названию или нику участника).
+    Find,
+    /// Поиск игрока в «Позвать в группу».
+    Invite,
 }
+
+/// Сколько символов в строках поиска вкладки «Группы».
+const FIND_MAX: usize = 24;
 
 /// Набранный символ (экран мода, любые буквы, в том числе русские). true — его забрало поле вкладки «Группы».
 pub fn on_char(c: char) -> bool {
@@ -381,9 +396,12 @@ pub fn on_char(c: char) -> bool {
         GroupField::Name => (&mut st.group_name, crate::groups::NAME_MAX),
         GroupField::Pass => (&mut st.group_pass, crate::groups::PASS_MAX),
         GroupField::Join => (&mut st.join_pass, crate::groups::PASS_MAX),
+        GroupField::Find => (&mut st.group_find, FIND_MAX),
+        GroupField::Invite => (&mut st.invite_find, FIND_MAX),
     };
-    // «:» аддон считает началом флага, в пароле пробелы не нужны
-    let banned = c == ':' || (f != GroupField::Name && c.is_whitespace());
+    // «:» аддон считает началом флага, в пароле пробелы не нужны (в поиске — любые символы, кроме пробела в нике)
+    let search = matches!(f, GroupField::Find | GroupField::Invite);
+    let banned = if search { f == GroupField::Invite && c.is_whitespace() } else { c == ':' || (f != GroupField::Name && c.is_whitespace()) };
     if !banned && buf.chars().count() < max {
         buf.push(c);
     }
@@ -402,6 +420,8 @@ fn submit_group_field(st: &mut State, f: GroupField) {
                 st.group_field = Some(GroupField::Name);
             }
         }
+        // поиск фильтрует сразу, Enter просто убирает курсор
+        GroupField::Find | GroupField::Invite => st.group_field = None,
         GroupField::Join => {
             let id = st.join_id.clone();
             if let Some(g) = id.and_then(|id| crate::groups::list().into_iter().find(|g| g.id == id)) {
@@ -427,6 +447,8 @@ fn group_key(st: &mut State, key: &str, pressed: bool) -> bool {
                 GroupField::Name => &mut st.group_name,
                 GroupField::Pass => &mut st.group_pass,
                 GroupField::Join => &mut st.join_pass,
+                GroupField::Find => &mut st.group_find,
+                GroupField::Invite => &mut st.invite_find,
             };
             buf.pop();
         }
@@ -435,7 +457,7 @@ fn group_key(st: &mut State, key: &str, pressed: bool) -> bool {
             st.group_field = match f {
                 GroupField::Name => Some(GroupField::Pass),
                 GroupField::Pass => Some(GroupField::Name),
-                GroupField::Join => Some(GroupField::Join),
+                other => Some(other),
             }
         }
         "key.keyboard.escape" => st.group_field = None,
@@ -544,18 +566,31 @@ pub struct Fx {
     /// Подмешать цвет `tint` (RGB) на долю `tint_t` (0..1).
     pub tint: u32,
     pub tint_t: f32,
+    /// Ширина по горизонтали: 1 — как есть, 0 — ребром, меньше нуля — обратной стороной (монетка крутится).
+    pub flip: f32,
 }
 
 impl Fx {
-    pub const NONE: Fx =
-        Fx { a: 1.0, dx: 0.0, dy: 0.0, glint: -1.0, ripple_from: 0, ripple: 0.0, phase: 0.0, spin: 0.0, tint: 0, tint_t: 0.0 };
+    pub const NONE: Fx = Fx {
+        a: 1.0,
+        dx: 0.0,
+        dy: 0.0,
+        glint: -1.0,
+        ripple_from: 0,
+        ripple: 0.0,
+        phase: 0.0,
+        spin: 0.0,
+        tint: 0,
+        tint_t: 0.0,
+        flip: 1.0,
+    };
 }
 
 /// Иконка с эффектами `fx`. Без эффектов рисуется быстро, готовыми отрезками.
 pub fn draw_icon_fx(c: &mut dyn Canvas, icon: &Icon, x: i32, y: i32, scale: i32, fx: Fx) {
     let ox = x + (fx.dx * scale as f32).round() as i32;
     let oy = y + (fx.dy * scale as f32).round() as i32;
-    if fx.glint < 0.0 && fx.ripple <= 0.0 && fx.spin == 0.0 && fx.tint_t <= 0.0 {
+    if fx.glint < 0.0 && fx.ripple <= 0.0 && fx.spin == 0.0 && fx.tint_t <= 0.0 && fx.flip == 1.0 {
         for &(rx, ry, n, argb) in icon.runs {
             c.fill(ox + rx as i32 * scale, oy + ry as i32 * scale, n as i32 * scale, scale, mul_alpha(argb, fx.a));
         }
@@ -610,9 +645,137 @@ pub fn draw_icon_fx(c: &mut dyn Canvas, icon: &Icon, x: i32, y: i32, scale: i32,
             if fx.tint_t > 0.0 {
                 col = lerp_argb(col, (col & 0xFF00_0000) | (fx.tint & 0x00FF_FFFF), fx.tint_t.min(1.0));
             }
+            if fx.flip != 1.0 {
+                // монетка крутится: столбец сжимается к середине, обратная сторона темнее
+                let f = fx.flip.clamp(-1.0, 1.0);
+                if f < 0.0 {
+                    col = lerp_argb(col, (col & 0xFF00_0000) | 0x0030_1050, 0.45);
+                }
+                let edge = |gx: f32| ox as f32 + (cx + (gx - cx) * f) * scale as f32;
+                let (l, r) = (edge(px as f32), edge(px as f32 + 1.0));
+                let (l, r) = (l.min(r).round() as i32, l.max(r).round() as i32);
+                let wpx = (r - l).max(if f.abs() < 0.08 && px == w / 2 { 1 } else { 0 });
+                if wpx > 0 {
+                    c.fill(l, oy + py as i32 * scale, wpx, scale, mul_alpha(col, al));
+                }
+                continue;
+            }
             c.fill(ox + px as i32 * scale, oy + py as i32 * scale, scale, scale, mul_alpha(col, al));
         }
     }
+}
+
+// ---------- монетка-значок в шапке ----------
+
+/// Сколько звонов монеты ждут, пока их проиграет `lib.rs` (у меню нет доступа к звукам игры), и их высота.
+pub static COIN_SOUNDS: Mutex<Vec<f32>> = Mutex::new(Vec::new());
+
+struct Coin {
+    /// Когда щёлкнули последние разы (для «много раз подряд»).
+    hits: Vec<Instant>,
+    jump_at: Option<Instant>,
+    flip_at: Option<Instant>,
+    /// Восемь щелчков подряд: когда показали благодарность.
+    thanks_at: Option<Instant>,
+}
+
+static COIN: Mutex<Coin> = Mutex::new(Coin { hits: Vec::new(), jump_at: None, flip_at: None, thanks_at: None });
+/// Где в шапке значок (низ слева): под ним всплывает благодарность.
+static LOGO_AT: Mutex<(i32, i32)> = Mutex::new((8, 24));
+
+/// Столько щелчков за `COIN_COMBO` — и монетка переворачивается.
+const COIN_FLIP_HITS: usize = 5;
+/// Столько щелчков подряд — и под значком благодарность проекту JeleCraft; держится `THANKS_FOR` секунд.
+const COIN_THANKS_HITS: usize = 8;
+const THANKS_FOR: f32 = 5.0;
+const COIN_COMBO: Duration = Duration::from_millis(1600);
+const COIN_JUMP: f32 = 0.35;
+const COIN_FLIP: f32 = 0.7;
+
+fn coin_click() {
+    let now = Instant::now();
+    let Ok(mut c) = COIN.lock() else { return };
+    c.hits.retain(|t| now.duration_since(*t) < COIN_COMBO);
+    c.hits.push(now);
+    c.jump_at = Some(now);
+    let combo = c.hits.len();
+    // пятый щелчок — переворот, восьмой — ещё переворот и благодарность (счёт идёт дальше, пока щёлкают подряд)
+    let thanks = combo >= COIN_THANKS_HITS;
+    let flips = (combo == COIN_FLIP_HITS || thanks) && c.flip_at.is_none_or(|t| now.duration_since(t).as_secs_f32() > COIN_FLIP);
+    if flips {
+        c.flip_at = Some(now);
+    }
+    if thanks {
+        c.thanks_at = Some(now);
+        c.hits.clear();
+    }
+    // звон чуть выше с каждым щелчком подряд; переворот — самый высокий
+    let pitch = if flips { 2.0 } else { (1.0 + combo as f32 * 0.12).min(1.8) };
+    if let Ok(mut q) = COIN_SOUNDS.lock() {
+        if q.len() < 8 {
+            q.push(pitch);
+        }
+    }
+}
+
+/// Благодарность под значком после восьми щелчков: плавно выезжает, держится и гаснет.
+fn draw_thanks(ui: &mut Ui, gw: i32) {
+    let Some(at) = COIN.lock().ok().and_then(|c| c.thanks_at) else { return };
+    let e = at.elapsed().as_secs_f32();
+    if e >= THANKS_FOR {
+        return;
+    }
+    let a = (e / 0.2).min(1.0) * ((THANKS_FOR - e) / 0.6).min(1.0);
+    let (lx, ly) = LOGO_AT.lock().map(|g| *g).unwrap_or((8, 24));
+    let line1 = crate::i18n::tr("Спасибо проекту");
+    let line2 = crate::i18n::tr("за поддержку ♥");
+    let name = "JeleCraft";
+    let w1 = text_width(&format!("{line1} {name}"));
+    let w = w1.max(text_width(&line2)) + 14;
+    let h = 26;
+    let x = lx.min(gw - w - 4).max(2);
+    let y = ly + 4 - ((1.0 - (e / 0.25).min(1.0)) * 4.0) as i32;
+    ui.frame(x, y, w, h, mul_alpha(0xFFA8_55F7, a), mul_alpha(0xF012_0A1E, a));
+    // уголок-стрелка к значку
+    ui.fill(x + 8, y - 1, 3, 1, mul_alpha(0xFFA8_55F7, a));
+    ui.fill(x + 9, y - 2, 1, 1, mul_alpha(0xFFA8_55F7, a));
+    ui.text(&line1, x + 7, y + 4, mul_alpha(TEXT, a));
+    // название проекта — золотом, с бегущим бликом
+    let nx = x + 7 + text_width(&format!("{line1} "));
+    let glow = 0.5 + 0.5 * (e * 4.0).sin();
+    ui.text(name, nx, y + 4, mul_alpha(lerp_argb(0xFFFF_C84A, 0xFFFF_F0B0, glow), a));
+    ui.text(&line2, x + 7, y + 14, mul_alpha(0xFFD8_C8F8, a));
+}
+
+/// Подпрыгивание и переворот монетки (поверх обычного покачивания).
+fn coin_fx(fx: &mut Fx) {
+    let Ok(c) = COIN.lock() else { return };
+    if let Some(t) = c.jump_at {
+        let e = t.elapsed().as_secs_f32();
+        if e < COIN_JUMP {
+            let k = e / COIN_JUMP;
+            fx.dy -= 2.5 * (k * std::f32::consts::PI).sin() * (1.0 - k);
+            fx.spin = 0.25 * (k * std::f32::consts::PI * 3.0).sin() * (1.0 - k);
+        }
+    }
+    if let Some(t) = c.flip_at {
+        let e = t.elapsed().as_secs_f32();
+        if e < COIN_FLIP {
+            let k = e / COIN_FLIP;
+            // ease-out: быстро раскручивается, мягко встаёт на место; два полуоборота = целый оборот
+            let ang = (1.0 - (1.0 - k).powi(3)) * std::f32::consts::TAU;
+            fx.flip = ang.cos();
+            fx.spin = 0.0;
+            fx.dy -= 4.0 * (k * std::f32::consts::PI).sin();
+            fx.tint = 0xFFD7_00;
+            fx.tint_t = 0.35 * (k * std::f32::consts::PI).sin();
+        }
+    }
+}
+
+/// Звоны монеты, которые надо проиграть (высота тона каждого).
+pub fn take_coin_sounds() -> Vec<f32> {
+    COIN_SOUNDS.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default()
 }
 
 /// Что иконка на кнопке делает при наведении и переключении.
@@ -689,6 +852,10 @@ impl Ui<'_> {
 
     fn face(&mut self, skin: &str, x: i32, y: i32, size: i32) {
         self.c.face(skin, x, y, size);
+    }
+
+    fn face_part(&mut self, skin: &str, x: i32, y: i32, size: i32, from: i32, rows: i32) {
+        self.c.face_part(skin, x, y, size, from, rows);
     }
 
     /// Плавно приблизить значение под `key` к `target` (`speed` — чем больше, тем быстрее). Впервые видим
@@ -1388,9 +1555,8 @@ fn page_devices(ui: &mut Ui, x: i32, y: i32, w: i32) {
         if ui.clicked(x, ry, 150, 18) {
             S::set_mic_test(!testing);
         }
-        let hint = if !S::connected() {
-            ("Нужно подключение к голосу", ERR)
-        } else if !S::mic_ok() {
+        // без голосового сервера проверка тоже работает (своя сессия без сети, lib.rs)
+        let hint = if testing && !S::mic_ok() {
             ("Микрофон не доступен", ERR)
         } else if testing && S::push_to_talk() {
             ("Держите клавишу рации", DIM)
@@ -1430,7 +1596,8 @@ const SRC_GROUP: u32 = 11;
 const SRC_MUSIC: u32 = 12;
 /// Размеры строки игрока, как в Plasmo: голова 24×24, ползунок 100×20 и две кнопки 20×20.
 const FACE: i32 = 24;
-const ROW_H: i32 = 30;
+/// Шаг строк: карточка 26 и зазор 2 (на экране 1080p с масштабом 3 так помещается шесть игроков).
+const ROW_H: i32 = 28;
 const CTL_W: i32 = 100 + 4 + 20 + 4 + 20;
 const KEY_LOCAL: &str = "\0local";
 const KEY_GROUP: &str = "\0group";
@@ -1564,18 +1731,36 @@ fn page_players(ui: &mut Ui, x: i32, y: i32, w: i32) {
         return;
     }
 
-    // сколько строк помещается; остальное — колесом мыши
-    let rows = (((ui.gh - top) / ROW_H).max(1) as usize).min(8);
+    // Список доходит до самого низа экрана (у окна снизу нет рамки). Сколько целых строк помещается —
+    // столько и листается колесом; прокрутка плавная: строки едут, а те, что задевает край (снизу экрана
+    // или под поиском), рисуются обрезанными — видно, что список продолжается.
+    let bottom = ui.gh + 8;
+    let rows = (((bottom - top - 26) / ROW_H + 1).max(1) as usize).min(12);
     let scroll = S::players_scroll().min(list.len().saturating_sub(rows));
     S::set_players_scroll(scroll); // игроки вышли — список стал короче, прокрутку подтягиваем
-    for (i, p) in list.iter().enumerate().skip(scroll).take(rows) {
-        let row = i - scroll;
-        let ry = top + row as i32 * ROW_H;
+    let pos = ui.ease(akey(19, x, top), scroll as f32, scroll as f32, 18.0).max(0.0);
+    let first = pos.floor() as usize;
+    let off = ((pos - first as f32) * ROW_H as f32).round() as i32;
+    for (i, p) in list.iter().enumerate().skip(first) {
+        let row = i - first;
+        let ry = top + row as i32 * ROW_H - off;
+        if ry >= bottom {
+            break;
+        }
+        if ry < top - 1 || ry + 26 > bottom {
+            partial_row(ui, p, x, w, ry, top, bottom);
+            if ui.clicked(x - 3, ry.max(top), w + 6, (ry + 26).min(bottom) - ry.max(top)) {
+                S::set_players_scroll(if ry < top { scroll.saturating_sub(1) } else { scroll + 1 });
+                ui.changed = true;
+            }
+            continue;
+        }
         let pct = S::player_volume_pct(&p.nick);
 
         // карточка строки (у говорящего зелёная кромка) и рамка головы, как слот предмета
-        ui.row_hover(x - 3, ry - 2, w + 6, 28);
-        let talk_t = ui.ease(akey(12, x, ry), 0.0, if p.talking { 1.0 } else { 0.0 }, 12.0);
+        ui.row_hover(x - 3, ry - 1, w + 6, 26);
+        let nick_key = p.nick.bytes().fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(b as u64));
+        let talk_t = ui.ease((12 << 44) ^ (nick_key & 0xFFF_FFFF_FFFF), 0.0, if p.talking { 1.0 } else { 0.0 }, 12.0);
         if talk_t > 0.0 {
             ui.fill(x - 1, ry - 1, FACE + 2, FACE + 2, mul_alpha(LED, talk_t));
         }
@@ -1635,7 +1820,33 @@ fn page_players(ui: &mut Ui, x: i32, y: i32, w: i32) {
         }
     }
 
+    // тень у нижнего края экрана: всегда, а не только пока снизу есть ещё игроки (иначе она «пропадала»,
+    // когда долистаешь до конца)
+    // мягкая, на всю ширину окна (между его боковыми линиями)
+    let shade = 14;
+    for k in 0..shade {
+        let a = (0x70 * (k + 1) / shade) as u32;
+        ui.fill(x - 9, bottom - shade + k, w + 18, 1, a << 24);
+    }
+
     list_scrollbar(ui, x + w + 4, top - 2, rows.min(list.len()) as i32 * ROW_H - 4, scroll, rows, list.len());
+}
+
+/// Строка списка игроков, которую задевает край (низ экрана или верх списка под поиском): видимая часть
+/// головы и, если влезает, бледный ник. Ползунки и кнопки у такой строки не рисуются.
+fn partial_row(ui: &mut Ui, p: &roster::MenuPlayer, x: i32, w: i32, ry: i32, top: i32, bottom: i32) {
+    let px = FACE / 8; // экранных точек на пиксель скина
+    let from = ((top - ry).max(0) + px - 1) / px;
+    let to = (((bottom - ry).min(FACE)) / px).min(8);
+    if to > from {
+        match faces::skin(&p.nick) {
+            Some(skin) => ui.face_part(&skin, x, ry + from * px, FACE, from, to - from),
+            None => ui.fill(x, ry + from * px, FACE, (to - from) * px, 0xFF3A_3A3A),
+        }
+    }
+    if ry + 8 >= top && ry + 8 < bottom {
+        ui.text(&fit(&p.nick, w - CTL_W - FACE - 10), x + FACE + 4, ry + 8, DIM);
+    }
 }
 
 /// Подпись активации: известные по-русски, остальные — имя с большой буквы.
@@ -1910,6 +2121,24 @@ fn page_overlay(ui: &mut Ui, x: i32, y: i32, w: i32) {
     S::set_notes_on(notes);
     let label = toggle(ui, &mut ry, "Название трека над пластинкой", "Табличка с названием над проигрывателем", S::disc_label_on());
     S::set_disc_label_on(label);
+    let glow = toggle(ui, &mut ry, "Блик на проигрывателе", "Пока играет пластинка, по проигрывателю пробегает белый блик", S::disc_glow_on());
+    S::set_disc_glow_on(glow);
+    let focus = toggle(
+        ui,
+        &mut ry,
+        "Громче тот, на который смотришь",
+        "Когда рядом играют несколько пластинок, та, на которую смотришь, звучит громко, остальные — тихо",
+        S::disc_focus_on(),
+    );
+    S::set_disc_focus_on(focus);
+    let solo = toggle(
+        ui,
+        &mut ry,
+        "Слушать только закреплённую",
+        "Музыка с пластинок не слышна, пока не закрепите проигрыватель клавишей «Закрепить пластинку» (вкладка «Клавиши»); слышно только его",
+        S::pin_solo_on(),
+    );
+    S::set_pin_solo_on(solo);
     page_scroll(ui, x, y, w, ry);
 }
 
@@ -1992,6 +2221,23 @@ fn page_groups(ui: &mut Ui, x: i32, y: i32, w: i32) {
     }
     ry += 18;
 
+    // приглашение, если есть: те же «Принять» / «Отказаться», что на плашке в игре
+    if let Some((text, gname, _)) = crate::groups::pending_invite() {
+        let ch = 30;
+        ui.frame(x, ry, w, ch, RUST, 0xFF1A_1024);
+        ui.icon(&icons::TAB_GROUPS, x + 6, ry + 6, 1);
+        let line = invite_line(&text, gname.as_deref());
+        ui.text(&fit(&line, w - 18 - 150), x + 18, ry + 5, TEXT);
+        ui.text("Вас приглашают в группу", x + 18, ry + 17, DIM);
+        if ui.button(x + w - 146, ry + 7, 70, 16, "Принять") {
+            crate::groups::accept_invite();
+        }
+        if ui.button(x + w - 72, ry + 7, 66, 16, "Отказаться") {
+            crate::groups::decline_invite();
+        }
+        ry += ch + 6;
+    }
+
     // ваша группа
     let mine = crate::groups::mine();
     let card_h = 30;
@@ -2002,7 +2248,15 @@ fn page_groups(ui: &mut Ui, x: i32, y: i32, w: i32) {
             let lw = text_width("Вы в группе") + 4;
             ui.text("Вы в группе", x + 18, ry + 5, DIM);
             ui.text(&fit(&g.name, w - 18 - lw - 64), x + 18 + lw, ry + 5, TEXT);
-            ui.text(&fit(&g.info, w - 18 - 64), x + 18, ry + 17, 0x8A8A8A);
+            // кто в группе: головы и ники (сервер Plasmo не перечисляет того, кто спрашивает, — себя добавляем)
+            let mut who = g.members.clone();
+            let me = S::self_name();
+            if !me.is_empty() && !who.iter().any(|m| m.eq_ignore_ascii_case(&me)) {
+                who.insert(0, me);
+            }
+            let hw = member_heads(ui, x + 18, ry + 17, &who, 8, 10);
+            let names = if who.is_empty() { g.info.clone() } else { who.join(", ") };
+            ui.text(&fit(&names, w - 18 - hw - 4 - 64), x + 18 + hw + 4, ry + 17, 0x8A8A8A);
             if !g.members.is_empty() {
                 ui.tooltip(x, ry, w - 60, card_h, &g.members.join(", "));
             }
@@ -2017,33 +2271,61 @@ fn page_groups(ui: &mut Ui, x: i32, y: i32, w: i32) {
     }
     ry += card_h + 8;
 
-    // группы, в которые можно войти
-    let others: Vec<crate::groups::Group> = crate::groups::list().into_iter().filter(|g| !g.mine).collect();
+    // группы, в которые можно войти; поиск — по названию группы или по нику того, кто в ней
+    let all_others: Vec<crate::groups::Group> = crate::groups::list().into_iter().filter(|g| !g.mine).collect();
+    let (focus, join_id, find) = {
+        let st = lock();
+        (st.group_field, st.join_id.clone(), st.group_find.clone())
+    };
+    let mut clicked_field = false;
+    if !all_others.is_empty() || !find.is_empty() {
+        if search_input(ui, x, ry, w, &find, "Найти группу или игрока в ней…", focus == Some(GroupField::Find)) {
+            lock().group_field = Some(GroupField::Find);
+            clicked_field = true;
+        }
+        ry += 22;
+    }
+    let needle = find.trim().to_lowercase();
+    let others: Vec<crate::groups::Group> = all_others
+        .into_iter()
+        .filter(|g| {
+            needle.is_empty()
+                || g.name.to_lowercase().contains(&needle)
+                || g.members.iter().any(|m| m.to_lowercase().contains(&needle))
+        })
+        .collect();
     if others.is_empty() {
-        let msg = if !crate::groups::fetched() { "Загружаю список групп…" } else { "Других групп пока нет." };
+        let msg = if !needle.is_empty() {
+            "Нет групп с таким названием или игроком."
+        } else if !crate::groups::fetched() {
+            "Загружаю список групп…"
+        } else {
+            "Других групп пока нет."
+        };
         centered(ui, x, w, msg, ry + 4, DIM);
         ry += 20;
     }
-    let (focus, join_id) = {
-        let st = lock();
-        (st.group_field, st.join_id.clone())
-    };
-    let mut clicked_field = false;
     for g in &others {
         let rh = 22;
         let open = join_id.as_deref() == Some(g.id.as_str());
         let hot = ui.hover(x, ry, w, rh);
         ui.fill(x, ry, w, rh, if hot || open { 0x2AFF_FFFF } else { 0x18FF_FFFF });
-        let mut tx = x + 6;
-        if g.locked {
-            ui.icon(&icons::TAB_LOCK, tx, ry + 7, 1);
-            tx += 12;
-        }
+        // значок: замок у группы с паролем, иначе значок группы; дальше название и головы участников
+        ui.icon(if g.locked { &icons::TAB_LOCK } else { &icons::TAB_GROUPS }, x + 6, ry + 7, 1);
+        let tx = x + 18;
         let bw = 58;
-        let name = fit(&g.name, w / 2);
+        let name = fit(&g.name, w / 3);
         let nw = text_width(&name);
         ui.text(&name, tx, ry + 7, TEXT);
-        ui.text(&fit(&g.info, w - (tx - x) - nw - bw - 16), tx + nw + 6, ry + 7, 0x8A8A8A);
+        let hx = tx + nw + 8;
+        let hw = member_heads(ui, hx, ry + 7, &g.members, 8, 8);
+        if g.members.is_empty() {
+            ui.text(&fit(&g.info, w - (hx - x) - bw - 12), hx, ry + 7, 0x8A8A8A);
+        } else {
+            let n = g.members.len();
+            let count = format!("{n}");
+            ui.text(&count, hx + hw + 4, ry + 7, 0x8A8A8A);
+        }
         if !g.members.is_empty() {
             ui.tooltip(x, ry, w - bw - 8, rh, &g.members.join(", "));
         }
@@ -2124,17 +2406,77 @@ fn page_groups(ui: &mut Ui, x: i32, y: i32, w: i32) {
         }
         ry += 20;
     }
-    centered(ui, x, w, "Enter — создать, Tab — к паролю", ry + 2, 0x6E6E6E);
-    ry += 16;
-    // клик мимо полей снимает фокус (сам клик достанется тому, что под курсором)
-    if ui.pressed && !clicked_field {
-        lock().group_field = None;
-    }
+    ry += 2;
     // ответ сервера на последнюю кнопку
     if let Some(msg) = crate::groups::status() {
         ui.fill(x, ry, w, 16, 0x30A8_55F7);
         centered(ui, x, w, &fit(&msg, w - 8), ry + 4, TEXT);
         ry += 22;
+    }
+
+    // приглашения (только Plasmo: у Simple Voice Chat их нет): от кого показывать
+    if crate::groups::can_invite() {
+        use crate::settings::InviteMode;
+        heading(ui, x, w, "Приглашения", ry);
+        ry += 14;
+        let modes = [
+            (InviteMode::AllExcept, "От всех, кроме", "Показывать приглашения от всех, кроме отмеченных ниже"),
+            (InviteMode::OnlyFrom, "Только от", "Показывать приглашения только от отмеченных ниже"),
+            (InviteMode::Nobody, "Ни от кого", "Не показывать приглашения вовсе (и в чат они не пишутся)"),
+        ];
+        let cur = S::invite_mode();
+        let kw = (w - 8) / 3;
+        for (i, (m, label, tip)) in modes.into_iter().enumerate() {
+            let bx = x + i as i32 * (kw + 4);
+            let sel = cur == m;
+            let bg = if sel { BTN_SEL } else { ui.shade(bx, ry, kw, 16, 0xFF24_2424, BTN_HOVER) };
+            ui.vbox(bx, ry, kw, 16, if sel { ACCENT } else { BLACK }, bg);
+            ui.text(label, bx + (kw - text_width(label)) / 2, ry + 4, TEXT);
+            ui.tooltip(bx, ry, kw, 16, tip);
+            if ui.clicked(bx, ry, kw, 16) {
+                S::set_invite_mode(m);
+                ui.changed = true;
+            }
+        }
+        ry += 20;
+        if cur != InviteMode::Nobody {
+            // игроки с голосом рядом и все уже отмеченные: отметка — «не принимать» или «принимать»
+            let only = cur == InviteMode::OnlyFrom;
+            let marked = if only { S::invite_allowed() } else { S::invite_blocked() };
+            let me = S::self_name().to_lowercase();
+            let mut nicks: Vec<String> = roster::menu_players().into_iter().map(|p| p.nick).filter(|n| n.to_lowercase() != me).collect();
+            for m in &marked {
+                if !nicks.iter().any(|n| n.to_lowercase() == *m) {
+                    nicks.push(m.clone());
+                }
+            }
+            if nicks.is_empty() {
+                centered(ui, x, w, "Рядом нет игроков с голосовым чатом.", ry + 2, DIM);
+                ry += 16;
+            } else {
+                ui.text(if only { "Отметьте, от кого принимать:" } else { "Отметьте, от кого не принимать:" }, x, ry + 2, DIM);
+                ry += 14;
+            }
+            for n in nicks.into_iter().take(16) {
+                let rh = 18;
+                match faces::skin(&n) {
+                    Some(skin) => ui.face(&skin, x + 4, ry + 1, 16),
+                    None => ui.fill(x + 4, ry + 1, 16, 16, 0xFF3A_3A3A),
+                }
+                let on = if only { S::is_invite_allowed(&n) } else { S::is_invite_blocked(&n) };
+                let v = ui.toggle(x + 26, ry + 1, w - 26, &fit(&n, w - 80), on);
+                if v != on {
+                    if only {
+                        S::set_invite_allowed(&n, v);
+                    } else {
+                        S::set_invite_blocked(&n, v);
+                    }
+                    ui.changed = true;
+                }
+                ry += rh;
+            }
+        }
+        ry += 6;
     }
 
     // позвать игроков в свою группу
@@ -2144,22 +2486,73 @@ fn page_groups(ui: &mut Ui, x: i32, y: i32, w: i32) {
         // в группе уже: участники из подсказки сервера и вы сами (сервер не перечисляет того, кто спрашивает)
         let mut lower: Vec<String> = g.members.iter().map(|m| m.to_lowercase()).collect();
         lower.push(S::self_name().to_lowercase());
+        let all_free: Vec<roster::MenuPlayer> =
+            roster::menu_players().into_iter().filter(|p| !lower.contains(&p.nick.to_lowercase())).collect();
+        let ifind = lock().invite_find.clone();
+        if !all_free.is_empty() || !ifind.is_empty() {
+            if search_input(ui, x, ry, w, &ifind, "Найти игрока…", focus == Some(GroupField::Invite)) {
+                lock().group_field = Some(GroupField::Invite);
+                clicked_field = true;
+            }
+            ry += 22;
+        }
+        let ineedle = ifind.trim().to_lowercase();
         let free: Vec<roster::MenuPlayer> =
-            roster::menu_players().into_iter().filter(|p| !lower.contains(&p.nick.to_lowercase())).take(10).collect();
+            all_free.into_iter().filter(|p| ineedle.is_empty() || p.nick.to_lowercase().contains(&ineedle)).take(10).collect();
         if free.is_empty() {
-            centered(ui, x, w, "Рядом нет игроков с голосовым чатом, кого можно позвать.", ry + 2, DIM);
+            let msg = if ineedle.is_empty() { "Рядом нет игроков с голосовым чатом, кого можно позвать." } else { "Игроков с таким ником нет." };
+            centered(ui, x, w, msg, ry + 2, DIM);
             ry += 16;
         }
         for p in &free {
             let rh = 20;
-            ui.text(&fit(&p.nick, w - 80), x + 6, ry + 6, TEXT);
-            if ui.button(x + w - 64, ry + 2, 60, 16, "Позвать") {
+            ui.fill(x, ry, w, rh - 2, if ui.hover(x, ry, w, rh - 2) { 0x2AFF_FFFF } else { 0x12FF_FFFF });
+            match faces::skin(&p.nick) {
+                Some(skin) => ui.face(&skin, x + 4, ry + 1, 16),
+                None => ui.fill(x + 4, ry + 1, 16, 16, 0xFF3A_3A3A),
+            }
+            ui.text(&fit(&p.nick, w - 96), x + 26, ry + 5, TEXT);
+            if ui.button(x + w - 64, ry + 1, 60, 16, "Позвать") {
                 crate::groups::invite(&p.nick);
             }
             ry += rh;
         }
     }
+    // клик мимо полей снимает фокус (сам клик достанется тому, что под курсором)
+    if ui.pressed && !clicked_field {
+        lock().group_field = None;
+    }
     page_scroll(ui, x, y, w, ry + 4);
+}
+
+/// Головы участников группы в ряд (`size`×`size`, кратно 8 — пиксели скина остаются чёткими; до `max`,
+/// дальше «+N»). Возвращает ширину ряда.
+fn member_heads(ui: &mut Ui, x: i32, y: i32, members: &[String], size: i32, max: usize) -> i32 {
+    let mut cx = x;
+    for m in members.iter().take(max) {
+        match faces::skin(m) {
+            Some(skin) => ui.face(&skin, cx, y, size),
+            None => ui.fill(cx, y, size, size, 0xFF3A_3A3A),
+        }
+        ui.tooltip(cx, y, size, size, m);
+        cx += size + 1;
+    }
+    if members.len() > max {
+        let more = format!("+{}", members.len() - max);
+        ui.text(&more, cx + 2, y + (size - 8) / 2, 0x8A8A8A);
+        cx += text_width(&more) + 3;
+    }
+    (cx - x - 1).max(0)
+}
+
+/// Строка поиска вкладки «Группы»: лупа слева, как у поиска игроков во «Громкости». true — по ней щёлкнули.
+fn search_input(ui: &mut Ui, x: i32, y: i32, w: i32, value: &str, hint: &str, focus: bool) -> bool {
+    let clicked = group_input(ui, x, y, w, &format!("     {value}"), "", focus, false);
+    ui.icon(&LENS, x + 4, y + 5, 1);
+    if value.is_empty() && !focus {
+        ui.text(&fit(hint, w - 24), x + 17, y + 5, 0x6E6E6E);
+    }
+    clicked
 }
 
 /// Поле ввода вкладки «Группы»: тёмное, с подсказкой и мигающим курсором в фокусе; пароль — точками.
@@ -2280,6 +2673,15 @@ fn page_controls(ui: &mut Ui, x: i32, y: i32, w: i32) {
     section(ui, &mut ry, "Дистанция голоса «Локальный»");
     action(ui, &mut ry, "dist_up", "Следующая дистанция из разрешённых сервером");
     action(ui, &mut ry, "dist_down", "Предыдущая дистанция из разрешённых сервером");
+    ry += 6;
+
+    section(ui, &mut ry, "Пластинки");
+    action(
+        ui,
+        &mut ry,
+        "pin_disc",
+        "Смотрите на проигрыватель и нажмите: он звучит громко, куда бы вы ни смотрели. Ещё раз — снять",
+    );
     ry += 6;
 
     section(ui, &mut ry, "Команды в чате");
@@ -2464,14 +2866,23 @@ fn window(ui: &mut Ui, gw: i32, gh: i32, tab: Tab) -> Tab {
         ui.fill(sa, hy + hh - 1, sb - sa, 1, mul_alpha(RUST, 0.75));
     }
 
-    // значок Plasmo: чуть покачивается, раз в несколько секунд по нему пробегает блик
+    // значок: чуть покачивается, раз в несколько секунд по нему пробегает блик. Это ещё и монетка: щелчок —
+    // звон золотой монеты и подпрыгивание, много щелчков подряд — монетка переворачивается.
     let mut logo = Fx::NONE;
     logo.dy = 0.5 * (secs * 2.2).sin();
     let g = (ms % 4200.0) / 1000.0;
     if g < 1.0 {
         logo.glint = g;
     }
-    ui.icon_fx(&icons::LOGO, 8, hy + 5, 2, logo);
+    let (lx, ly, lsz) = (8, hy + 5, icons::LOGO.w as i32 * 2);
+    if ui.clicked(lx - 2, ly - 2, lsz + 4, lsz + 4) {
+        coin_click();
+    }
+    coin_fx(&mut logo);
+    ui.icon_fx(&icons::LOGO, lx, ly, 2, logo);
+    if let Ok(mut at) = LOGO_AT.lock() {
+        *at = (lx, ly + lsz);
+    }
     let tx0 = 8 + 18;
     ui.text("Rust", tx0, hy + 9, RUST_TEXT);
     ui.text("Voice", tx0 + text_width("Rust "), hy + 9, TEXT);
@@ -2661,6 +3072,7 @@ pub fn draw(c: &mut dyn Canvas, mouse: (i32, i32)) {
         clip: (0, gh),
     };
     let new_tab = window(&mut ui, gw, gh, tab);
+    draw_thanks(&mut ui, gw);
 
     // Подсказка у курсора.
     if let Some(tip) = ui.tip.take() {
@@ -2970,6 +3382,48 @@ pub fn draw_notice(c: &mut dyn Canvas, gw: i32, gh: i32) {
 }
 
 /// Подсказка над прицелом после ПКМ + колесо: «ник  120%» и полоса громкости. `gw`, `gh` — размер GUI.
+/// Название группы из текста приглашения («… в группу [название]»).
+fn bracket_name(text: &str) -> Option<String> {
+    text.rsplit_once('[').and_then(|(_, r)| r.split_once(']')).map(|(n, _)| n.trim().to_string()).filter(|n| !n.is_empty())
+}
+
+/// Текст приглашения: как прислал сервер, а если текста нет — «Приглашение в группу <название>».
+fn invite_line(text: &str, group: Option<&str>) -> String {
+    if !text.trim().is_empty() {
+        return text.trim().to_string();
+    }
+    match group {
+        Some(g) => format!("{} {g}", crate::i18n::tr("Приглашение в группу")),
+        None => crate::i18n::tr("Приглашение в группу").to_string(),
+    }
+}
+
+/// Плашка приглашения в группу сверху экрана (в игре, пока меню закрыто): текст сервера, подсказка клавиш
+/// и полоска оставшегося времени.
+pub fn draw_invite(c: &mut dyn Canvas, gw: i32, _gh: i32) {
+    let Some((text, gname, age)) = crate::groups::pending_invite() else { return };
+    // коротко: «Ник → [группа]» и клавиши; одна строка
+    let group = bracket_name(&text).or(gname);
+    let line = match (crate::groups::invite_from(), group) {
+        (Some(f), Some(g)) => format!("{f} → [{g}]"),
+        _ => invite_line(&text, None),
+    };
+    let hint = "Y ✔  N ✖";
+    let w = (text_width(&line) + text_width(hint) + 30).min((gw - 16).max(120));
+    let h = 14;
+    let (x, y) = (gw / 2 - w / 2, 4);
+    // появляется и гаснет плавно
+    let a = ((age / 0.02).min(1.0) * ((1.0 - age) / 0.05).min(1.0)).clamp(0.0, 1.0);
+    let k = |argb: u32| mul_alpha(argb, a);
+    rounded(c, x, y, w, h, k(0xB014_0A20));
+    draw_icon_fx(c, &icons::TAB_GROUPS, x + 4, y + 3, 1, Fx { a, ..Fx::NONE });
+    c.text(&fit(&line, w - text_width(hint) - 26), x + 16, y + 3, TEXT, true);
+    c.text(hint, x + w - text_width(hint) - 5, y + 3, 0xC7_9BFF, true);
+    // сколько осталось
+    let left = ((1.0 - age) * (w - 4) as f32).round() as i32;
+    c.fill(x + 2, y + h - 1, left.max(0), 1, k(0x90A8_55F7));
+}
+
 /// Громкость игрока после ПКМ + колесо: маленькая фиолетовая плашка над его ником (`tag` — верх его тега
 /// на экране), а если игрока не видно — под прицелом, с ником.
 pub fn draw_volume_toast(c: &mut dyn Canvas, gw: i32, gh: i32, tag: Option<(i32, i32)>) {
@@ -3003,6 +3457,31 @@ pub fn draw_volume_toast(c: &mut dyn Canvas, gw: i32, gh: i32, tag: Option<(i32,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coin_rings_and_flips_after_five_clicks() {
+        let _ = take_coin_sounds();
+        for _ in 0..4 {
+            coin_click();
+        }
+        assert!(COIN.lock().unwrap().flip_at.is_none(), "четыре щелчка — ещё не переворот");
+        coin_click();
+        assert!(COIN.lock().unwrap().flip_at.is_some(), "пятый подряд — переворот");
+        let sounds = take_coin_sounds();
+        assert_eq!(sounds.len(), 5);
+        assert!(sounds.windows(2).take(3).all(|p| p[1] > p[0]), "каждый следующий звон выше: {sounds:?}");
+        assert_eq!(sounds[4], 2.0);
+        let mut fx = Fx::NONE;
+        coin_fx(&mut fx);
+        assert!(fx.flip <= 1.0 && fx.dy <= 0.0);
+        // ещё три подряд (всего восемь) — благодарность
+        COIN.lock().unwrap().flip_at = None;
+        for _ in 0..3 {
+            coin_click();
+        }
+        assert!(COIN.lock().unwrap().thanks_at.is_some(), "восьмой щелчок — благодарность JeleCraft");
+        let _ = take_coin_sounds();
+    }
 
     #[derive(Default)]
     struct Rec {

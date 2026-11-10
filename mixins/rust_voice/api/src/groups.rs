@@ -122,6 +122,12 @@ struct State {
     /// Ответ закончился, но аддон может дописать разделитель («групп нет» он обрамляет двумя): до этой
     /// минуты один разделитель ещё наш.
     tail_until: Option<Instant>,
+    /// Приглашение в группу (pv-addon-groups), ещё не принятое и не отклонённое.
+    invite: Option<Invite>,
+    /// Последнее системное сообщение чата: у приглашения текст может прийти строкой раньше кнопки.
+    last_sys: Option<(String, Instant)>,
+    /// Когда последний раз просили список: опоздавший ответ (кнопки «Войти») — не приглашение.
+    browse_at: Option<Instant>,
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
@@ -146,6 +152,9 @@ static STATE: Mutex<State> = Mutex::new(State {
     svc_new_pass: None,
     svc_detach: Detach::Attached,
     tail_until: None,
+    invite: None,
+    last_sys: None,
+    browse_at: None,
 });
 
 /// Сколько ждём ответ на `/groups browse` (и его следующую страницу).
@@ -510,6 +519,7 @@ pub fn take_actions() -> Vec<Action> {
     if st.window.is_none() && st.refresh_at.is_some_and(|t| now >= t) {
         st.refresh_at = None;
         st.window = Some(now);
+        st.browse_at = Some(now);
         st.answered = false;
         st.collecting.clear();
         st.partial = None;
@@ -572,6 +582,29 @@ struct Piece {
 }
 
 /// UUID в тексте: 36 символов, дефисы на своих местах.
+/// UUID где угодно в сообщении: в кликах, в подсказке при наведении («Uuid: …») или в самом тексте.
+fn find_uuid(t: &Text) -> Option<String> {
+    let mut hay = String::new();
+    for sp in &t.spans {
+        hay.push(' ');
+        hay.push_str(&sp.text);
+        if let Some(c) = &sp.style.click {
+            match c {
+                ClickEvent::RunCommand(v) | ClickEvent::SuggestCommand(v) | ClickEvent::CopyToClipboard(v) => {
+                    hay.push(' ');
+                    hay.push_str(v);
+                }
+                _ => {}
+            }
+        }
+        if let Some(h) = &sp.style.hover {
+            hay.push(' ');
+            hay.push_str(&plain(h));
+        }
+    }
+    hay.split(|c: char| !(c.is_ascii_hexdigit() || c == '-')).find(|w| is_uuid(w)).map(str::to_string)
+}
+
 fn is_uuid(s: &str) -> bool {
     let b = s.as_bytes();
     b.len() == 36
@@ -727,6 +760,7 @@ fn on_browse(st: &mut State, p: Piece) -> bool {
             // ещё страница: просим её на ближайшем tick, окно продлеваем
             st.page = next;
             st.window = Some(Instant::now());
+            st.browse_at = Some(Instant::now());
             st.answered = false;
             st.actions.push(Action::Command(format!("groups browse {next}")));
             return true;
@@ -751,6 +785,57 @@ pub fn on_chat(t: &Text, menu_open: bool) -> bool {
     let mut st = lock();
     let now = Instant::now();
     let p = parse(t, st.page);
+    let prev_sys = st.last_sys.replace((plain(t).trim().to_string(), now));
+    // Приглашение в группу (pv-addon-groups): разделитель, «X пригласил(а) вас в группу [название]»
+    // (название — с UUID в клике), иногда кнопка «Присоединиться», разделитель. Когда мы сами ничего не
+    // спрашивали, весь этот блок прячем, а вместо него — плашка «Принять» / «Отказаться» (`draw_invite`).
+    let ours_now = st.window.is_some()
+        || st.browse_at.is_some_and(|b| now.duration_since(b) < LATE_BROWSE)
+        || st.reply_window.is_some_and(|w| now.duration_since(w) < REPLY_WINDOW);
+    if !ours_now {
+        // рамка: строка из чёрточек или зачёркнутая (как `&8&m-----` у аддона); пустые строки других плагинов не трогаем
+        let dashes = p.divider && (!plain(t).trim().is_empty() || t.spans.iter().any(|s| s.style.strikethrough == Some(true)));
+        if dashes {
+            // разделители печатает только аддон групп: вне наших запросов они — рамка приглашения
+            st.tail_until = Some(now + INVITE_TAIL);
+            return true;
+        }
+        // строка внутри рамки (сразу после спрятанного разделителя) или с названием группы — текст приглашения
+        let in_frame = st.tail_until.is_some_and(|u| now < u) && !p.divider && st.invite.is_none();
+        let named = p.name.is_some() && !p.info.trim().is_empty() && p.members.is_empty();
+        if (named || in_frame) && !plain(t).trim().is_empty() {
+            let text = plain(t).trim().to_string();
+            let from = inviter(&text);
+            let id = p.name.as_ref().map(|(id, _)| id.clone()).or_else(|| find_uuid(t));
+            let cmd = join_command(t).or_else(|| id.as_ref().map(|id| format!("groups join {id}")));
+            let id = id.unwrap_or_default();
+            let cmd = cmd.unwrap_or_default();
+            st.tail_until = Some(now + INVITE_TAIL);
+            if crate::settings::invite_accepted(from.as_deref()) {
+                let group_id = (!id.is_empty()).then_some(id);
+                st.invite = Some(Invite { command: cmd, group_id, text, from, at: now });
+            }
+            return true;
+        }
+        if let Some(cmd) = join_command(t).filter(|_| p.name.is_none()) {
+            // кнопка «Присоединиться» отдельной строкой: к уже показанному приглашению или своё
+            let tail = st.tail_until.is_some_and(|u| now < u);
+            match st.invite.as_mut().filter(|_| tail) {
+                Some(inv) => inv.command = cmd,
+                None if tail => {} // приглашение заблокировано: кнопку тоже прячем
+                None => {
+                    let text = prev_sys.filter(|(_, at)| now.duration_since(*at) < INVITE_TEXT_GAP).map(|(s, _)| s).unwrap_or_default();
+                    let from = inviter(&text);
+                    let id = cmd.split_whitespace().nth(2).filter(|s| is_uuid(s)).map(str::to_string);
+                    if crate::settings::invite_accepted(from.as_deref()) {
+                        st.invite = Some(Invite { command: cmd, group_id: id, text, from, at: now });
+                    }
+                }
+            }
+            st.tail_until = Some(now + INVITE_TAIL);
+            return true;
+        }
+    }
     // хвостовой разделитель ответа, который уже закончился
     if st.window.is_none() && p.divider && st.tail_until.is_some_and(|u| now < u) {
         st.tail_until = None;
@@ -785,9 +870,103 @@ pub fn on_chat(t: &Text, menu_open: bool) -> bool {
     ours
 }
 
+// ---------- приглашения ----------
+
+/// Приглашение в группу от pv-addon-groups.
+#[derive(Clone, Debug)]
+struct Invite {
+    /// Команда кнопки «Присоединиться» (без `/`), как её прислал сервер.
+    command: String,
+    group_id: Option<String>,
+    /// Текст приглашения от сервера («AniLiaSS пригласил(а) вас в группу тестер»), на языке сервера.
+    text: String,
+    /// Кто позвал (ник из текста), если узнали.
+    from: Option<String>,
+    at: Instant,
+}
+
+/// Рамка приглашения (разделители и кнопка) приходит следом за текстом: столько её ещё прячем.
+const INVITE_TAIL: Duration = Duration::from_millis(1200);
+
+/// Кто позвал: ник игрока с голосом из текста приглашения (самый длинный, что нашёлся), иначе первое слово.
+fn inviter(text: &str) -> Option<String> {
+    let low = text.to_lowercase();
+    let me = crate::settings::self_name().to_lowercase();
+    let known = crate::roster::menu_players()
+        .into_iter()
+        .map(|p| p.nick)
+        .filter(|n| n.to_lowercase() != me && low.contains(&n.to_lowercase()))
+        .max_by_key(|n| n.len());
+    known.or_else(|| {
+        text.split_whitespace()
+            .next()
+            .map(|w| w.trim_matches(|c: char| !(c.is_alphanumeric() || c == '_')).to_string())
+            .filter(|w| (3..=16).contains(&w.len()) && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+    })
+}
+
+/// Сколько висит приглашение, если на него не ответили.
+pub const INVITE_FOR: Duration = Duration::from_secs(30);
+/// После запроса списка столько строк с «Войти» считаем опоздавшим ответом, а не приглашением.
+const LATE_BROWSE: Duration = Duration::from_secs(10);
+/// Текст приглашения может прийти отдельной строкой прямо перед кнопкой.
+const INVITE_TEXT_GAP: Duration = Duration::from_millis(1500);
+
+/// Команда `groups join …` из кликов сообщения.
+fn join_command(t: &Text) -> Option<String> {
+    t.spans.iter().find_map(|s| {
+        s.style.click.as_ref().and_then(click_command).filter(|c| c.starts_with("groups join ")).map(|c| c.trim().to_string())
+    })
+}
+
+/// Текущее приглашение: (текст, название группы, если известно, сколько уже висит 0..1).
+pub fn pending_invite() -> Option<(String, Option<String>, f32)> {
+    let mut st = lock();
+    let inv = st.invite.clone()?;
+    let age = inv.at.elapsed();
+    if age >= INVITE_FOR || !crate::settings::invites_on() {
+        st.invite = None;
+        return None;
+    }
+    let name = inv.group_id.as_ref().and_then(|id| st.list.iter().find(|g| &g.id == id).map(|g| g.name.clone()));
+    Some((inv.text, name, age.as_secs_f32() / INVITE_FOR.as_secs_f32()))
+}
+
+/// Кто позвал в текущем приглашении.
+pub fn invite_from() -> Option<String> {
+    lock().invite.as_ref().and_then(|i| i.from.clone())
+}
+
+
+/// Принять приглашение: та же команда, что у кнопки в чате.
+pub fn accept_invite() {
+    let mut st = lock();
+    let Some(inv) = st.invite.take() else { return };
+    let mut cmd = inv.command;
+    if cmd.is_empty() {
+        // сервер не дал UUID: ищем группу по названию из текста («… в группу [название]») в списке
+        let name = inv.text.rsplit_once('[').and_then(|(_, r)| r.split_once(']')).map(|(n, _)| n.trim().to_lowercase());
+        if let Some(g) = name.and_then(|n| st.list.iter().find(|g| g.name.to_lowercase() == n).cloned()) {
+            cmd = format!("groups join {}", g.id);
+        }
+    }
+    if cmd.is_empty() {
+        st.status = Some(("Не нашёл эту группу — войдите из списка".to_string(), Instant::now()));
+        return;
+    }
+    command(&mut st, cmd);
+}
+
+pub fn decline_invite() {
+    lock().invite = None;
+}
+
 /// Сервер сменился: старый список не годится.
 pub fn reset() {
     let mut st = lock();
+    st.invite = None;
+    st.last_sys = None;
+    st.browse_at = None;
     st.list.clear();
     st.collecting.clear();
     st.partial = None;
@@ -1017,5 +1196,104 @@ mod tests {
         let id = [0xAB; 16];
         assert_eq!(svc_id_bytes(&svc_id(&id)), Some(id));
         assert_eq!(svc_id_bytes("xyz"), None);
+    }
+
+    #[test]
+    fn invite_becomes_a_card_not_chat() {
+        let _one = serial();
+        reset();
+        // текст приглашения строкой раньше, кнопка «Присоединиться» следом
+        let msg = text(vec![span("AniLiaSS пригласил(а) вас в группу тестер", None, None)]);
+        assert!(!on_chat(&msg, false), "текст сам по себе — обычный чат");
+        let id = "123e4567-e89b-12d3-a456-426614174000";
+        let button = text(vec![span("→ Присоединиться", Some(ClickEvent::RunCommand(format!("/groups join {id}"))), None)]);
+        let _ = id;
+        assert!(on_chat(&button, false), "кнопку забирает плашка");
+        let (t, _, age) = pending_invite().expect("приглашение есть");
+        assert!(t.contains("тестер") && age < 0.1);
+        accept_invite();
+        assert!(pending_invite().is_none());
+        let cmds: Vec<String> = take_actions().into_iter().filter_map(|a| match a {
+            Action::Command(c) => Some(c),
+            _ => None,
+        }).collect();
+        assert_eq!(cmds.first().map(String::as_str), Some(format!("groups join {id}").as_str()));
+        reset();
+    }
+
+    #[test]
+    fn whole_invite_block_is_hidden_and_filtered_by_sender() {
+        let _one = serial();
+        reset();
+        crate::settings::set_invite_mode(crate::settings::InviteMode::AllExcept);
+        // как на сервере: разделитель, «X пригласил(а) вас в группу [название]» (название с UUID), разделитель
+        let line = text(vec![
+            span("Steve пригласил(а) вас в группу ", None, None),
+            span("[ек]", Some(ClickEvent::SuggestCommand(ID.into())), None),
+        ]);
+        let frame = text(vec![span("-----------------", None, None)]);
+        assert!(on_chat(&frame, false), "верхний разделитель спрятан");
+        assert!(on_chat(&line, false), "текст приглашения спрятан");
+        assert!(on_chat(&frame, false), "нижний разделитель спрятан");
+        let (t, _, _) = pending_invite().expect("плашка есть");
+        assert!(t.contains("[ек]"));
+        assert_eq!(invite_from().as_deref(), Some("Steve"));
+        // «от всех, кроме Steve»: следующее от него не показывается
+        crate::settings::set_invite_blocked("Steve", true);
+        decline_invite();
+        std::thread::sleep(INVITE_TAIL);
+        assert!(on_chat(&line, false), "строка всё равно не в чате");
+        assert!(pending_invite().is_none(), "от заблокированного — без плашки");
+        crate::settings::set_invite_blocked("Steve", false);
+        // «только от»: Steve не в списке — не показываем
+        crate::settings::set_invite_mode(crate::settings::InviteMode::OnlyFrom);
+        std::thread::sleep(INVITE_TAIL);
+        assert!(on_chat(&line, false));
+        assert!(pending_invite().is_none());
+        crate::settings::set_invite_allowed("Steve", true);
+        std::thread::sleep(INVITE_TAIL);
+        assert!(on_chat(&line, false));
+        assert!(pending_invite().is_some(), "а когда отмечен — показываем");
+        decline_invite();
+        crate::settings::set_invite_allowed("Steve", false);
+        // ни от кого
+        crate::settings::set_invite_mode(crate::settings::InviteMode::Nobody);
+        std::thread::sleep(INVITE_TAIL);
+        assert!(on_chat(&line, false));
+        assert!(pending_invite().is_none());
+        crate::settings::set_invite_mode(crate::settings::InviteMode::AllExcept);
+        // принять — команда входа по UUID из названия
+        std::thread::sleep(INVITE_TAIL);
+        assert!(on_chat(&line, false));
+        accept_invite();
+        let cmds: Vec<String> = take_actions().into_iter().filter_map(|a| match a {
+            Action::Command(c) => Some(c),
+            _ => None,
+        }).collect();
+        assert_eq!(cmds.first().cloned(), Some(format!("groups join {ID}")));
+        reset();
+    }
+
+    #[test]
+    fn invite_with_uuid_only_in_hover() {
+        let _one = serial();
+        reset();
+        crate::settings::set_invite_mode(crate::settings::InviteMode::AllExcept);
+        let frame = text(vec![span("-----------------", None, None)]);
+        let line = text(vec![
+            span("Player78306 пригласил(а) вас в группу ", None, None),
+            span("[343434]", None, Some(&format!("Uuid: {ID}"))),
+        ]);
+        assert!(on_chat(&frame, false));
+        assert!(on_chat(&line, false), "строка приглашения внутри рамки спрятана");
+        assert!(on_chat(&frame, false));
+        assert!(pending_invite().is_some());
+        accept_invite();
+        let cmds: Vec<String> = take_actions().into_iter().filter_map(|a| match a {
+            Action::Command(c) => Some(c),
+            _ => None,
+        }).collect();
+        assert_eq!(cmds.first().cloned(), Some(format!("groups join {ID}")), "UUID взят из подсказки");
+        reset();
     }
 }

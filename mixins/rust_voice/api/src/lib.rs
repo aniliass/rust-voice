@@ -69,6 +69,8 @@ struct State {
     key: crypto::RsaKey,
     aes_key: Option<[u8; 16]>,
     voice: Option<voice::VoiceCtl>,
+    /// `voice` — сессия без сервера, только для «Проверки звука» (в одиночном мире, на сервере без голоса).
+    offline_voice: bool,
     outbox: voice::Outbox,
     /// Пришёл ли Connection (сервер принял наш PlayerInfo).
     connected: bool,
@@ -107,6 +109,7 @@ impl State {
             key,
             aes_key: None,
             voice: None,
+            offline_voice: false,
             outbox: Arc::new(Mutex::new(Vec::new())),
             connected: false,
             info_sent: 0,
@@ -254,6 +257,7 @@ fn on_svc_packet(st: &mut State, host: &dyn Host, channel: &str, data: &[u8], mo
                 secret.distance, secret.codec, secret.mtu, secret.keep_alive, secret.groups
             ));
             st.voice = None; // старая сессия (если была) закрывается
+            st.offline_voice = false;
             st.svc = true;
             st.svc_state_sent = None;
             st.svc_version = secret.version;
@@ -283,6 +287,7 @@ fn on_svc_packet(st: &mut State, host: &dyn Host, channel: &str, data: &[u8], mo
                 activation_id: plasmo::activation_id("proximity"),
                 distance: secret.distance.clamp(0.0, i16::MAX as f64) as i16,
                 bitrate: 0,
+                offline: false,
             });
             st.voice = Some(v);
         }
@@ -338,6 +343,10 @@ fn run_action(action: &str) {
             Some(d) => settings::notice(&format!("Дистанция «Локальный»: {d}")),
             None => settings::notice("Сервер не даёт менять дистанцию"),
         },
+        "pin_disc" => {
+            notes::toggle_pin();
+            return;
+        }
         _ => return,
     }
     settings::save();
@@ -413,6 +422,14 @@ impl Hooks for Mod {
         }
         if !event.pressed {
             return;
+        }
+        // Приглашение в группу: Y — принять, N — отказаться (только в игре, не в чате и не в меню).
+        if host.playing() && groups::pending_invite().is_some() {
+            match &*event.key {
+                "key.keyboard.y" => return groups::accept_invite(),
+                "key.keyboard.n" => return groups::decline_invite(),
+                _ => {}
+            }
         }
         // Клавиши действий (вкладка «Клавиши»): только в игре, чтобы буква в чате не выключала микрофон.
         if host.playing() {
@@ -491,6 +508,24 @@ impl Hooks for Mod {
         let mut st = self.state.lock_ok();
         // Без голосового сервера (одиночный мир, сервер без плагина) список устройств читаем сами, в фоне:
         // микрофон и наушники можно выбрать заранее, и они понадобятся на первом же сервере с голосом.
+        // «Проверка звука» без голосового сервера: своя сессия без сети — микрофон, шумодав и наушники те же,
+        // что на сервере. Закончили проверку или подключились к серверу — она закрывается.
+        if settings::mic_test() && st.voice.is_none() {
+            let logger = voice::file_logger(log_path(), st.start);
+            let v = voice::start(voice::Link::Offline, Arc::clone(&st.outbox), logger);
+            v.configure(voice::SessionConfig {
+                aes: [0; 16],
+                activation_id: plasmo::activation_id("proximity"),
+                distance: 32,
+                bitrate: 0,
+                offline: true,
+            });
+            st.voice = Some(v);
+            st.offline_voice = true;
+        } else if st.offline_voice && !settings::mic_test() {
+            st.voice = None;
+            st.offline_voice = false;
+        }
         if st.voice.is_none() && settings::take_mic_refresh() {
             std::thread::spawn(|| {
                 settings::set_mic_list(voice::input_names());
@@ -521,6 +556,13 @@ impl Hooks for Mod {
         }
         // Группы Plasmo (pv-addon-groups): команды кнопок меню и запрос списка групп
         // и группы Simple Voice Chat: пакеты create_group / set_group / leave_group
+        // щелчки по монетке-значку в шапке меню: звон золотой монеты (у самой камеры, слышно только вам)
+        for pitch in menu::take_coin_sounds() {
+            if let Some(cam) = host.camera() {
+                let at = [cam.position[0], cam.position[1], cam.position[2]];
+                let _ = host.play_local_sound("minecraft:entity.experience_orb.pickup", at, 0.6, pitch, 0);
+            }
+        }
         groups::svc_tick(); // SVC: «Локальный» в обычной группе — временно выйти из неё и вернуться
         for a in groups::take_actions() {
             match a {
@@ -767,6 +809,7 @@ impl Hooks for Mod {
                     c.ip = ip;
                     let logger = voice::file_logger(log_path(), st.start);
                     st.voice = Some(voice::start(voice::Link::Plasmo(c), Arc::clone(&st.outbox), logger));
+                    st.offline_voice = false;
                 }
                 None => st.log("Connection: не разобрался"),
             },
@@ -797,6 +840,7 @@ impl Hooks for Mod {
                                 activation_id: plasmo::activation_id("proximity"),
                                 distance: cfg.proximity_distance.unwrap_or(32) as i16,
                                 bitrate,
+                                offline: false,
                             };
                             match &st.voice {
                                 Some(v) => v.configure(sc),
@@ -834,6 +878,11 @@ impl Hooks for Mod {
             let tag = nametag::tag_top(&*host, &nick, right + 2.0, bottom + 2.0).map(|(x, y)| (x.round() as i32, y.round() as i32));
             let mut gui = Gui { host: &*host, batch: &mut *event.batch };
             menu::draw_volume_toast(&mut gui, gui_w, gui_h, tag);
+        }
+        // приглашение в группу (pv-addon-groups): плашка сверху, Y — принять, N — отказаться
+        if !menu::is_live() && groups::pending_invite().is_some() {
+            let mut gui = Gui { host: &*host, batch: &mut *event.batch };
+            menu::draw_invite(&mut gui, gui_w, gui_h);
         }
         // «Микрофон выключен», «Дистанция: 32» после клавиш действий
         {
@@ -1005,6 +1054,25 @@ impl menu::Canvas for Gui<'_> {
             h: size,
             uv: [u, 8.0],
             src: [8, 8],
+            tex: [64, 64],
+            color: 0xFFFF_FFFF,
+        };
+        self.host.gui_paint(&mut *self.batch, &[layer(8.0), layer(40.0)]);
+    }
+
+    fn face_part(&mut self, skin: &str, x: i32, y: i32, size: i32, from: i32, rows: i32) {
+        use horizon_client::hud_layout::{Blend, GuiDraw};
+        let from = from.clamp(0, 7);
+        let rows = rows.clamp(1, 8 - from);
+        let layer = |u: f32| GuiDraw::Blit {
+            texture: std::borrow::Cow::Owned(skin.to_string()),
+            blend: Blend::Textured,
+            x,
+            y,
+            w: size,
+            h: size * rows / 8,
+            uv: [u, 8.0 + from as f32],
+            src: [8, rows],
             tex: [64, 64],
             color: 0xFFFF_FFFF,
         };

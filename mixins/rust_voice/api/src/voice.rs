@@ -37,6 +37,8 @@ pub struct SessionConfig {
     pub activation_id: [u8; 16],
     pub distance: i16,
     pub bitrate: i32,
+    /// Без сервера: только проверка звука (`Link::Offline`), «подключено» не показываем.
+    pub offline: bool,
 }
 
 pub struct VoiceCtl {
@@ -76,12 +78,16 @@ pub enum Link {
         /// Как часто сервер шлёт KeepAlive (мс): если молчит в 10 раз дольше, сессия мертва.
         keep_alive_ms: i32,
     },
+    /// Без сервера: микрофон и динамики работают только для «Проверки звука» в меню, на сеть ничего не уходит.
+    Offline,
 }
 
 impl Link {
     fn addr(&self) -> String {
         match self {
             Link::Plasmo(c) => format!("{}:{}", c.ip, c.port),
+            // сокет нужен коду ниже, но в него ничего не пишем
+            Link::Offline => "127.0.0.1:9".to_string(),
             Link::Svc { host, port, .. } => {
                 if host.contains(':') { format!("[{host}]:{port}") } else { format!("{host}:{port}") }
             }
@@ -693,7 +699,7 @@ impl Audio {
         settings::set_mic_list(input_names());
         settings::set_out_list(output_names());
         settings::set_distance(cfg.distance.max(0) as u32);
-        settings::set_connected(true);
+        settings::set_connected(!cfg.offline);
         let enc = OpusEncoder::new(RATE as i32, 1, Application::Voip).ok().map(|mut e| {
             e.bitrate_bps = if cfg.bitrate > 0 { cfg.bitrate } else { 24_000 };
             e.signal_type = Some(SignalType::Voice);
@@ -884,7 +890,7 @@ impl Audio {
         let (near, group) = match link {
             Link::Svc { .. } if crate::groups::SVC_ROUTE.load(std::sync::atomic::Ordering::Relaxed) == crate::groups::ROUTE_LOCAL => (any, false),
             Link::Svc { .. } if roster::self_group().is_some() => (false, any),
-            Link::Svc { .. } => (any, false),
+            Link::Svc { .. } | Link::Offline => (any, false),
             Link::Plasmo(_) => (
                 decisions.iter().any(|&(i, r, _)| r == Res::Activated && acts[i].proximity),
                 decisions.iter().any(|&(i, r, _)| r == Res::Activated && !acts[i].proximity),
@@ -908,10 +914,12 @@ impl Audio {
             }
         }
 
-        if settings::mic_test() {
+        let offline = matches!(link, Link::Offline);
+        if settings::mic_test() || offline {
             // Проверка звука: слышите то же, что услышали бы другие, но на сервер ничего не уходит.
+            // Без сервера (`Link::Offline`) голос только для проверки — и тоже никуда не уходит.
             self.end_all(&acts, outbox);
-            if any {
+            if any && settings::mic_test() {
                 let mut qs = self.play.lock_ok();
                 let src = qs.by_source.entry(TEST_SOURCE).or_insert_with(|| SrcQueue::new(1.0));
                 for f in &timeline {
@@ -934,7 +942,7 @@ impl Audio {
                         // Plasmo шифрует сам Opus, SVC — весь UDP-пакет целиком (ниже, при отправке)
                         packets.push(match link {
                             Link::Plasmo(_) => crypto::aes_encrypt(&self.cfg.aes, &self.packet[..len]),
-                            Link::Svc { .. } => self.packet[..len].to_vec(),
+                            Link::Svc { .. } | Link::Offline => self.packet[..len].to_vec(),
                         });
                     }
                 }
@@ -959,6 +967,7 @@ impl Audio {
                                 self.svc_seq += 1;
                                 session.wrap(svc::T_MIC, &svc::mic(data, self.svc_seq, false))
                             }
+                            Link::Offline => continue,
                         };
                         let _ = sock.send(&pkt);
                     }
@@ -1042,7 +1051,8 @@ impl Audio {
         // ноты над пластинкой вылетают в такт: громкость кадра
         let rms = (decoded.iter().map(|s| s * s).sum::<f32>() / decoded.len().max(1) as f32).sqrt();
         crate::notes::on_audio(&key, rms);
-        let gain = settings::music_volume_pct() as f32 / 100.0;
+        // выбор взглядом: тот, на который смотрим, громко, остальные рядом — тихо фоном
+        let gain = settings::music_volume_pct() as f32 / 100.0 * crate::notes::focus_gain(&key);
         self.enqueue(source_id, decoded, gain, distance, Some(key), true);
     }
 
@@ -1153,7 +1163,11 @@ fn run(
     let sock = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("bind: {e}"))?;
     sock.connect(&addr).map_err(|e| format!("connect {addr}: {e}"))?;
     sock.set_read_timeout(Some(Duration::from_millis(10))).map_err(|e| e.to_string())?;
-    let proto = if matches!(conn, Link::Svc { .. }) { "Simple Voice Chat" } else { "Plasmo Voice" };
+    let proto = match conn {
+        Link::Svc { .. } => "Simple Voice Chat",
+        Link::Plasmo(_) => "Plasmo Voice",
+        Link::Offline => "без сервера, проверка звука",
+    };
     log(format!("UDP-сессия к {addr} ({proto})"));
 
     let mut audio: Option<Audio> = None;
@@ -1170,6 +1184,7 @@ fn run(
     let stale_after = match &conn {
         Link::Svc { keep_alive_ms, .. } => Duration::from_millis((*keep_alive_ms).clamp(500, 30_000) as u64 * 10),
         Link::Plasmo(_) => STALE_AFTER,
+        Link::Offline => Duration::from_secs(24 * 3600),
     };
 
     while !stop.load(Ordering::Relaxed) {
@@ -1197,6 +1212,7 @@ fn run(
                     last_ping = Instant::now();
                 }
             }
+            Link::Offline => {}
         }
         while let Ok(cfg) = rx.try_recv() {
             log(format!(
@@ -1209,6 +1225,7 @@ fn run(
         if let Ok(n) = sock.recv(&mut buf) {
             got += 1;
             match &conn {
+                Link::Offline => {}
                 Link::Plasmo(_) => {
                     last_rx = Instant::now();
                     match plasmo::udp_split(&buf[..n]) {
@@ -1453,5 +1470,21 @@ mod tests {
             parse_pactl_sources(text),
             vec![("alsa_input.usb-Blue_Yeti-00.analog-stereo".to_string(), "Blue Yeti Analog Stereo".to_string())]
         );
+    }
+}
+#[cfg(test)]
+mod offline_tests {
+    #[test]
+    fn offline_session_runs_without_network() {
+        let out = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log: super::Logger = std::sync::Arc::new(|_s: String| {});
+        let v = super::start(super::Link::Offline, out.clone(), log);
+        v.configure(super::SessionConfig { aes: [0; 16], activation_id: [0; 16], distance: 32, bitrate: 0, offline: true });
+        crate::settings::set_mic_test(true);
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert!(!crate::settings::connected(), "без сервера «подключено» не показываем");
+        assert!(out.lock().unwrap().is_empty(), "на сервер ничего не ушло");
+        crate::settings::set_mic_test(false);
+        drop(v);
     }
 }
