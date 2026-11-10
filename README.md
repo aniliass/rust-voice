@@ -6,21 +6,26 @@ Proximity voice chat for [Horizon](https://playhorizon.dev), the Rust rewrite of
 
 ## What it does
 
-- **Two protocols in one mod.** On joining a server it asks for both Plasmo Voice (v2) and Simple Voice Chat (compatibility 21) and uses whichever the server answers. The Advanced tab shows which one is in use.
+- **Two protocols in one mod.** On joining a server it asks for Plasmo Voice (v2) and Simple Voice Chat (2.6 and 2.7, compatibility 20 and 21) and uses whichever the server answers. On Horizon servers it also talks to Horizon's own voicechat-server (Simple Voice Chat 2.6 over Horizon's mod messages). The Advanced tab shows which one is in use.
 - **Clean microphone:** high-pass filter, automatic gain with a soft limiter, a noise gate with pre-roll and hysteresis, and a spectral noise suppressor. *Learn noise* records the room's own hum so it can be removed.
 - **3D voices:** stereo panning with head shadow (HRTF-like timing and level differences), quieter and duller with distance (the air takes the highs away), muffled behind walls.
 - **Sound goes around corners:** when a wall is between you, the voice comes from the doorway or corridor it travels through (a path search over nearby blocks) instead of straight through the wall.
-- **Badges over names:** a microphone icon over each player that fills purple with their voice level, a red slash drawn when they mute, dimmed when the player is behind a wall.
+- **Badges over names:** a microphone icon over each player that fills purple with their voice level; a crossed-out microphone when they muted, crossed-out headphones when their sound is off, a grey "no" sign when they have no voice mod. Dimmed behind walls. The badge sits exactly where the game draws the name and doesn't lag when players run or jump.
+- **Notes over a playing disc:** while a server plays a disc or another sound at a point in the world (pv-addon-discs), coloured notes fly up from it in time with the music, like a note block's, and shatter against blocks above it. A small tag over the jukebox shows the track name with a spinning disc and level bars. Drawn by the mod itself, hidden behind walls; both can be turned off in the Overlay tab. A jukebox walled in by blocks sounds muffled.
+- **Groups menu for Plasmo Voice:** on servers with the pv-addon-groups add-on, the Groups tab lists the server's groups with their members, joins and leaves them, invites nearby players and creates new ones (name and password typed right in the menu). The add-on itself only has chat commands; the mod sends them and reads the answers, keeping them out of chat.
+- **Simple Voice Chat groups:** the same Groups tab on Simple Voice Chat servers — groups and members, joining (with a password), leaving and creating a group of a chosen type: normal, open or isolated. In a normal group two keys work: *Groups* talks to the group, *Local* only to players nearby (meanwhile the mod steps out of the group and comes back; the start of the phrase isn't lost). If you are alone in the group, the mod doesn't leave it.
 - **Groups at a glance:** while you talk, the HUD shows a white microphone for nearby voice and a purple microphone when your voice goes to your group (Plasmo Voice groups addon, Simple Voice Chat groups). Players talking in your group get a purple frame and, if you like, their own list in a corner you choose, separate from everyone else (Overlay tab, can be turned off). The Groups volume slider sets their volume.
+- **World sounds from Plasmo Voice servers:** music discs (pv-addon-discs) and other sounds the server places in the world play from their jukebox or entity, muffled behind walls and going around corners like voices, with their own *Music and sounds* volume.
 - **Plasmo Voice activations:** voice activation, push to talk on up to three keys, per-activation distance, as the server defines them.
 - **English, Russian and Ukrainian interface:** follows the language set in the game (Options > Language), or pick one on the Advanced tab.
 - **Menu** (key **M**, or `/voice`, `/vm`): devices, per-player volume (scroll with the wheel), activations, overlay, hotkeys (rebind inside the menu) and advanced settings. `/voice mute` and `/voice deaf` toggle the microphone and the voice chat.
+- **Player volume with the wheel:** hold the right mouse button, look at a player and scroll — a small purple tag with the percentage appears over their name.
 
 ## What it doesn't do (yet)
 
-- Simple Voice Chat **groups** cannot be joined or created from the menu (group voice is played if you are in a group), and **whisper** is not sent.
+- Simple Voice Chat **whisper** is not sent.
 - Simple Voice Chat location sounds (from server plugins) are played, but not placed in the world.
-- Simple Voice Chat 2.6 servers (compatibility 20) and Horizon's own voicechat-server are not supported yet.
+- On Simple Voice Chat 2.6 other players can't see that your microphone is off (that protocol version doesn't carry it) — only that your sound is off.
 
 ## What it touches
 

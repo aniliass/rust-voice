@@ -247,6 +247,46 @@ impl Params {
     pub const CENTER: Params = Params { gain: 1.0, side: 0.0, front: 1.0, occ: 0.0, far: 0.0 };
 }
 
+/// Простой поточный пересчёт частоты (линейный): для устройств, которые не дают открыть себя на 48 кГц
+/// (на Windows общий режим WASAPI принимает только родную частоту и число каналов устройства).
+/// Работает с кадрами из `N` каналов.
+pub struct Resampler<const N: usize> {
+    /// Сколько входных кадров приходится на один выходной.
+    step: f64,
+    /// Позиция между `prev` и следующим входным кадром (0..1).
+    pos: f64,
+    prev: [f32; N],
+    primed: bool,
+}
+
+impl<const N: usize> Resampler<N> {
+    pub fn new(from_hz: u32, to_hz: u32) -> Self {
+        Resampler { step: from_hz.max(1) as f64 / to_hz.max(1) as f64, pos: 0.0, prev: [0.0; N], primed: false }
+    }
+
+    /// Пропустить входные кадры, выходные отдать в `out`.
+    pub fn push(&mut self, input: &[[f32; N]], out: &mut impl FnMut([f32; N])) {
+        for &cur in input {
+            if !self.primed {
+                self.prev = cur;
+                self.primed = true;
+                continue;
+            }
+            while self.pos < 1.0 {
+                let t = self.pos as f32;
+                let mut f = [0.0; N];
+                for (k, v) in f.iter_mut().enumerate() {
+                    *v = self.prev[k] + (cur[k] - self.prev[k]) * t;
+                }
+                out(f);
+                self.pos += self.step;
+            }
+            self.pos -= 1.0;
+            self.prev = cur;
+        }
+    }
+}
+
 /// Какие эффекты включены в меню.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Mode {
@@ -565,6 +605,27 @@ mod tests {
         assert!(high < low * 0.3, "высокие частоты за стеной гаснут: {high} vs {low}");
         let (open, _) = ears(behind_wall, Mode { occlusion: false, ..ALL }, 5_000.0);
         assert!(open > 0.3, "заглушение выключено: {open}");
+    }
+
+    #[test]
+    fn resampler_keeps_length_and_shape() {
+        // 44.1 кГц -> 48 кГц: выходных кадров больше в 48000/44100 раз, синус остаётся синусом
+        let mut r = Resampler::<1>::new(44_100, 48_000);
+        let input: Vec<[f32; 1]> = (0..44_100).map(|i| [(i as f32 * 2.0 * PI * 440.0 / 44_100.0).sin()]).collect();
+        let mut out = Vec::new();
+        r.push(&input, &mut |f| out.push(f[0]));
+        assert!((out.len() as i32 - 48_000).abs() < 3, "{}", out.len());
+        let peak = out.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(peak > 0.95 && peak <= 1.0001, "{peak}");
+        // 48 кГц -> 44.1 кГц, стерео
+        let mut r = Resampler::<2>::new(48_000, 44_100);
+        let input = vec![[0.5f32, -0.5]; 48_000];
+        let mut n = 0;
+        r.push(&input, &mut |f| {
+            assert!((f[0] - 0.5).abs() < 1e-6 && (f[1] + 0.5).abs() < 1e-6);
+            n += 1;
+        });
+        assert!((n as i32 - 44_100).abs() < 3, "{n}");
     }
 
     #[test]

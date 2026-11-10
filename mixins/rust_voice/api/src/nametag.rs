@@ -19,6 +19,7 @@ use horizon_client::mod_api::Host;
 
 use crate::icons::{self, Icon};
 use crate::roster::Indicator;
+use crate::settings as S;
 
 /// Игрок считается «в кадре», если тег рисовали не позже этого срока назад.
 const SEEN_FOR: Duration = Duration::from_millis(120);
@@ -42,12 +43,12 @@ const TAG_HEIGHT: f64 = 2.3;
 const ICON_PX: f32 = 12.0;
 /// false — размер значков всегда `ICON_PX`. true — значки уменьшаются с расстоянием (дальше `NEAR_DIST` блоков).
 const SCALE_WITH_DISTANCE: bool = true;
-const NEAR_DIST: f64 = 4.0;
+const NEAR_DIST: f64 = 3.0;
 /// Насколько сильно значок уменьшается с расстоянием: 1.0 — как ник (1/расстояние), 0 — совсем не уменьшается.
 /// Маленькое значение делает уменьшение едва заметным.
-const SCALE_EXPONENT: f64 = 0.3;
-/// Минимальный размер значка (GUI-пиксели).
-const MIN_ICON_PX: f32 = 7.0;
+const SCALE_EXPONENT: f64 = 0.85;
+/// Минимальный размер значка (GUI-пиксели): примерно треть, как у таблички над пластинкой.
+const MIN_ICON_PX: f32 = 4.0;
 const GAP_PX: f32 = 3.0;
 /// Дальше этого расстояния (в блоках) значки не рисуем.
 const MAX_DIST: f64 = 30.0;
@@ -70,6 +71,8 @@ pub struct Cam {
     pub pos: [f64; 3],
     pub view: [f32; 16],
     pub proj: [f32; 16],
+    /// Доля тика этого кадра (0..1): по ней игра сама сглаживает движение.
+    pub partial: f32,
 }
 
 /// ЕДИНСТВЕННОЕ место, зависящее от API камеры Horizon (`Host::camera()`, PR «native camera»).
@@ -80,7 +83,20 @@ fn read_camera(host: &dyn Host) -> Option<Cam> {
         pos: [c.position[0], c.position[1], c.position[2]],
         view: c.view,
         proj: c.projection,
+        partial: c.partial_tick,
     })
+}
+
+/// Камера игры (для нот над пластинкой и других меток в мире).
+pub fn camera(host: &dyn Host) -> Option<Cam> {
+    read_camera(host)
+}
+
+/// Точка мира -> GUI-пиксели и расстояние до камеры (блоки). None — позади камеры.
+pub fn project(cam: &Cam, pos: [f64; 3], gui_w: f32, gui_h: f32) -> Option<(f32, f32, f64)> {
+    let d = [pos[0] - cam.pos[0], pos[1] - cam.pos[1], pos[2] - cam.pos[2]];
+    let (x, y) = to_screen(cam, d, gui_w, gui_h)?;
+    Some((x, y, (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()))
 }
 
 /// Куда смотрит камера: (глаза, единичный вектор взгляда) в мировых координатах. Для выбора игрока в `aim.rs`.
@@ -108,6 +124,8 @@ pub fn can_see(host: &dyn Host, pos: [f64; 3]) -> bool {
 
 struct Entry {
     nick: String,
+    /// id сущности: по нему у игры берётся точка ника на этот кадр (`client_heads`).
+    id: u32,
     pos: [f64; 3],
     seen: Instant,
     /// Виден ли игрок (нет стены между ним и камерой) и когда это считали в последний раз.
@@ -141,7 +159,7 @@ pub fn overlay_ok() -> bool {
 }
 
 /// Игрок с видимым тегом: запоминаем (и сглаживаем) его позицию. Зовётся из `render_name_tag` раз в кадр.
-pub fn note(nick: &str, pos: [f64; 3], sneaking: bool) {
+pub fn note(nick: &str, id: u32, pos: [f64; 3], sneaking: bool) {
     let now = Instant::now();
     let Ok(mut g) = TAGS.lock() else { return };
     let map = g.get_or_insert_with(HashMap::new);
@@ -172,6 +190,7 @@ pub fn note(nick: &str, pos: [f64; 3], sneaking: bool) {
                 e.s_at = now;
             }
             e.seen = now;
+            e.id = id;
             e.sneaking = sneaking;
         }
         None => {
@@ -179,6 +198,7 @@ pub fn note(nick: &str, pos: [f64; 3], sneaking: bool) {
                 nick.to_lowercase(),
                 Entry {
                     nick: nick.to_string(),
+                    id,
                     pos,
                     seen: now,
                     vis: true,
@@ -245,6 +265,37 @@ fn icon_size(d: [f64; 3]) -> f32 {
     (ICON_PX * k).clamp(MIN_ICON_PX, ICON_PX)
 }
 
+/// Точки ников на этот кадр от самой игры (`client_heads`, с долей тика): ровно там, где игра рисует ник,
+/// без отставания при прыжках и беге. Ключ — id сущности; значение — «ноги» (точка ника минус TAG_HEIGHT),
+/// как у остальных расчётов здесь.
+fn exact_positions(host: &dyn Host, cam: &Cam, ids: &[u32]) -> HashMap<u32, [f64; 3]> {
+    if ids.is_empty() || !(0.0..=1.0).contains(&cam.partial) {
+        return HashMap::new();
+    }
+    host.client_heads(ids, cam.partial as f64)
+        .into_iter()
+        .filter(|h| h.name_anchor.iter().all(|v| v.is_finite()))
+        .map(|h| (h.id, [h.name_anchor[0], h.name_anchor[1] - TAG_HEIGHT, h.name_anchor[2]]))
+        .collect()
+}
+
+/// Где на экране верх тега игрока `nick` (над его значком): (x по центру, y верха значка). None — игрока
+/// не видно (давно не было его тега, далеко, за краем экрана).
+pub fn tag_top(host: &dyn Host, nick: &str, gui_w: f32, gui_h: f32) -> Option<(f32, f32)> {
+    let cam = camera(host)?;
+    let (id, pos, size) = {
+        let g = TAGS.lock().ok()?;
+        let e = g.as_ref()?.get(&nick.to_lowercase())?;
+        if e.seen.elapsed() > SEEN_FOR * 3 {
+            return None;
+        }
+        (e.id, e.pos, (e.size > 0.0).then_some(e.size))
+    };
+    let pos = exact_positions(host, &cam, &[id]).remove(&id).unwrap_or(pos);
+    let p = place_sized(&cam, pos, gui_w, gui_h, size)?;
+    Some((p.cx, p.bottom - p.h))
+}
+
 pub fn place(cam: &Cam, pos: [f64; 3], gui_w: f32, gui_h: f32) -> Option<Placed> {
     place_sized(cam, pos, gui_w, gui_h, None)
 }
@@ -281,14 +332,14 @@ fn q(v: f32) -> f32 {
 const TALK_TINT: u32 = 0xA855F7;
 
 /// Какая иконка у значка и с какой яркостью (приоритет сверху вниз):
-/// голосовой чат выключен — перечёркнутый динамик; микрофон выключен (сам или сервером) — перечёркнутый
-/// микрофон; говорит — микрофон с фиолетовой капсулой; без мода — бледный «пропавший» микрофон.
+/// голосовой чат выключен — перечёркнутые наушники; микрофон выключен (сам или сервером) — перечёркнутый
+/// микрофон; говорит — микрофон с фиолетовой капсулой; без мода — серый знак «нет» (⊘).
 fn badge_icon(ind: Indicator) -> (&'static Icon, f32, bool) {
     match ind {
-        Indicator::Voice { spk_off: true, .. } => (&icons::SPK_OFF, 1.0, false),
+        Indicator::Voice { spk_off: true, .. } => (&icons::HEADPHONES_OFF, 1.0, false),
         Indicator::Voice { mic_off: true, .. } => (&icons::MIC_MUTED, 1.0, false),
         Indicator::Voice { talking, .. } => (&icons::MIC, 1.0, talking),
-        Indicator::NoMod => (&icons::MIC_GONE, 0.55, false),
+        Indicator::NoMod => (&icons::NO_VOICE, 0.8, false),
     }
 }
 
@@ -440,7 +491,9 @@ pub fn draw(host: &dyn Host, batch: &mut horizon_client::hud::HudBatch, gui_w: f
     };
     OVERLAY_OK.store(true, Relaxed);
     let now = Instant::now();
-    let mut tags: Vec<([f64; 3], f32, Indicator, f32, f32, f32)> = Vec::new();
+    let mut tags: Vec<(u32, [f64; 3], f32, Indicator, f32, f32, f32)> = Vec::new();
+    // кому сейчас меняют громкость (ПКМ + колесо): его значок прячем, над ником — плашка громкости
+    let adjusting = S::volume_toast().map(|(n, _, _)| n.to_lowercase());
     match TAGS.lock() {
         Ok(mut g) => {
             if let Some(map) = g.as_mut() {
@@ -456,7 +509,8 @@ pub fn draw(host: &dyn Host, batch: &mut horizon_client::hud::HudBatch, gui_w: f
                     } else {
                         e.size += (want - e.size) * (1.0 - (-dt / SIZE_SMOOTH_SECS).exp());
                     }
-                    match crate::roster::indicator(&e.nick) {
+                    let ind = crate::roster::indicator(&e.nick).filter(|_| adjusting.as_deref() != Some(e.nick.to_lowercase().as_str()));
+                    match ind {
                         Some(i) => {
                             // только что выключил микрофон или звук: черта начинает рисоваться
                             if slashed(i) && !e.ind.is_some_and(|old| slashed(old) && same_icon(old, i)) {
@@ -486,7 +540,7 @@ pub fn draw(host: &dyn Host, batch: &mut horizon_client::hud::HudBatch, gui_w: f
                     e.vis_t = if e.vis_t < to { (e.vis_t + step).min(to) } else { (e.vis_t - step).max(to) };
                     let wall = if e.sneaking { e.vis_t } else { BEHIND_WALL_ALPHA + (1.0 - BEHIND_WALL_ALPHA) * e.vis_t };
                     if wall > 0.01 {
-                        tags.push((e.pos, e.alpha * far_fade * wall, ind, e.size, e.level, reveal));
+                        tags.push((e.id, e.pos, e.alpha * far_fade * wall, ind, e.size, e.level, reveal));
                     }
                 }
             }
@@ -498,7 +552,10 @@ pub fn draw(host: &dyn Host, batch: &mut horizon_client::hud::HudBatch, gui_w: f
         .map(|d| (d.as_millis() % 3_600_000) as f32 / 1000.0)
         .unwrap_or(0.0);
     let mut fill = |r: [f32; 4], argb: u32| host.fill(&mut *batch, r, argb);
-    for (pos, alpha, ind, size, level, reveal) in tags {
+    let ids: Vec<u32> = tags.iter().map(|t| t.0).collect();
+    let exact = exact_positions(host, &cam, &ids);
+    for (id, pos, alpha, ind, size, level, reveal) in tags {
+        let pos = exact.get(&id).copied().unwrap_or(pos);
         let Some(p) = place_sized(&cam, pos, gui_w, gui_h, Some(size)) else { continue };
         let mut faded = |r: [f32; 4], argb: u32| fill(r, with_alpha(argb, alpha));
         draw_indicator(ind, p, phase, level, reveal, &mut faded);
@@ -525,12 +582,12 @@ mod tests {
             0.0, 0.0, 1.0, 0.0,
             0.0, 0.0, 0.0, 1.0,
         ];
-        Cam { pos: [0.0; 3], view, proj }
+        Cam { pos: [0.0; 3], view, proj, partial: 0.0 }
     }
 
     #[test]
     fn anchor_in_front_lands_in_screen_center_and_icons_sit_above() {
-        let p = place(&cam(), [0.0, -TAG_HEIGHT, -3.0], 240.0, 240.0).expect("точка перед камерой");
+        let p = place(&cam(), [0.0, -TAG_HEIGHT, -1.5], 240.0, 240.0).expect("точка перед камерой");
         assert!((p.cx - 120.0).abs() < 0.01);
         assert!(p.bottom < 120.0, "значки выше точки крепления тега");
         assert_eq!(p.h, ICON_PX, "вблизи полный размер");
@@ -602,7 +659,7 @@ mod tests {
         assert!(red(0.5) > 0 && red(0.5) < red(1.0), "посередине — наполовину");
         assert!(slashed(off) && !slashed(TALK));
         assert!(same_icon(off, Indicator::Voice { mic_off: true, spk_off: false, talking: true }), "заговорил при выключенном — та же иконка");
-        assert!(std::ptr::eq(badge_icon(Indicator::Voice { mic_off: true, spk_off: true, talking: true }).0, &icons::SPK_OFF), "звук выключен важнее");
+        assert!(std::ptr::eq(badge_icon(Indicator::Voice { mic_off: true, spk_off: true, talking: true }).0, &icons::HEADPHONES_OFF), "звук выключен важнее");
         assert!(badge_icon(Indicator::NoMod).1 < 1.0, "без мода — бледный значок");
     }
 
@@ -615,8 +672,8 @@ mod tests {
 
     #[test]
     fn note_smooths_and_forgets_unknown_nick_case() {
-        note("Steve", [0.0, 0.0, 0.0], false);
-        note("steve", [1.0, 0.0, 0.0], false);
+        note("Steve", 7, [0.0, 0.0, 0.0], false);
+        note("steve", 7, [1.0, 0.0, 0.0], false);
         let g = TAGS.lock().unwrap();
         let m = g.as_ref().unwrap();
         assert_eq!(m.get("steve").map(|e| e.nick.as_str()), Some("Steve"));

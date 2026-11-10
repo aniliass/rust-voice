@@ -114,6 +114,31 @@ def headphones():
     return grid(HEADPHONES_ROWS, KEY)
 
 
+NOTE_ROWS = [
+    "................",
+    "........WWWWWW..",
+    "........WWWWWW..",
+    "........W....W..",
+    "........W....W..",
+    "........W....W..",
+    "........W....W..",
+    "........W....W..",
+    "........W....W..",
+    "........W..LLW..",
+    ".....LLLW.LLLL..",
+    "....LLLLW.LLLL..",
+    "....LLLLW..LL...",
+    ".....LL.........",
+    "................",
+    "................",
+]
+
+
+def note():
+    """Music note: sounds of the world (discs, mobs)."""
+    return grid(NOTE_ROWS, KEY)
+
+
 def slash(g):
     """Red slash from the top-left to the bottom-right, 2 px thick with a dark edge."""
     for y in range(1, 15):
@@ -133,6 +158,21 @@ def gone(g):
     for i in range(3):
         put(g, 12 + i, 11 + i, L)
         put(g, 14 - i, 11 + i, L)
+    return g
+
+
+def no_voice():
+    """Player without a voice mod: grey "no" sign (circle with a slash), unlike the red-slashed mic and headphones."""
+    g = blank()
+    cx = cy = 7.5
+    for y in range(16):
+        for x in range(16):
+            d = ((x - cx) ** 2 + (y - cy) ** 2) ** 0.5
+            if 5.0 <= d <= 6.9:
+                put(g, x, y, M if y < 8 else D)
+            # перекладина из правого верхнего угла в левый нижний
+            if d < 5.0 and abs((x - cx) + (y - cy)) <= 1.0:
+                put(g, x, y, M if y < 8 else D)
     return g
 
 
@@ -234,6 +274,28 @@ TAB_ROWS = {
         "LL.LL.LL",
         "LL.LL.LL",
     ],
+    # two people: voice groups
+    "GROUPS": [
+        "........",
+        ".WW..LL.",
+        ".WW..LL.",
+        "........",
+        "WWWW.LLL",
+        "WWWW.LLL",
+        "WWWW.LLL",
+        "........",
+    ],
+    # padlock: password-protected group
+    "LOCK": [
+        "..MMMM..",
+        ".M....M.",
+        ".M....M.",
+        "WWWWWWWW",
+        "WWWKKWWW",
+        "WWWKKWWW",
+        "WWWWWWWW",
+        "LLLLLLLL",
+    ],
     # sound wave
     "ACTIVATION": [
         "....W...",
@@ -308,10 +370,12 @@ def icons():
     yield "MIC", mic(), "Microphone. Capsule rows 1..=8 fill with purple while the player talks."
     yield "MIC_MUTED", slash(mic()), "Microphone off: red slash."
     yield "MIC_GONE", gone(mic()), "Player without a voice mod: faded microphone with a cross."
+    yield "NO_VOICE", no_voice(), "Above a nick: player without a voice mod (grey no-sign)."
     yield "MIC_MENU", mic(), "Microphone in the menu."
     yield "MIC_MENU_OFF", slash(mic()), "Microphone (activation) off in the menu."
     yield "HEADPHONES", headphones(), "Headphones: the voice chat."
     yield "HEADPHONES_OFF", slash(headphones()), "Voice chat off (you hear nobody, and your microphone is off too)."
+    yield "NOTE", note(), "Music and world sounds (discs from pv-addon-discs)."
     yield "SPK", speaker(), "Speaker."
     yield "SPK_OFF", slash(speaker()), "Sound off: red slash."
     yield "SPK_MENU", speaker(), "Player volume in the menu."

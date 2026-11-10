@@ -1,6 +1,6 @@
 [mod]
 id = "rust_voice"
-version = "0.1.44"
+version = "0.1.46"
 
 [compatibility]
 horizon_revision = "fdc87aecdbd116bf1e08adcd062fcbaea8c2e2ca"

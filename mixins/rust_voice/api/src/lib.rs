@@ -4,10 +4,12 @@ mod crypto;
 mod denoise;
 mod dsp;
 mod faces;
+mod groups;
 mod i18n;
 mod icons;
 mod menu;
 mod nametag;
+mod notes;
 mod plasmo;
 mod roster;
 mod settings;
@@ -17,8 +19,8 @@ mod voice;
 
 use horizon_client::extras::Corner;
 use horizon_client::mod_api::{
-    ClientPacketEvent, ClientboundPlayPacket, CommandEvent, Flow, Hooks, Host, HudEvent, KeyEvent, ModsEvent,
-    MouseScrollingEvent, NativeMod, RenderNameTagEvent, ScreenMouseButtonPressedPreEvent, ScreenMouseButtonReleasedPreEvent, ScreenMouseScrolledPreEvent, ScreenRenderPostEvent,
+    ClientChatReceivedEvent, ClientPacketEvent, ClientboundPlayPacket, CommandEvent, Flow, Hooks, Host, HudEvent, KeyEvent, ModsEvent,
+    MouseScrollingEvent, NativeMod, RenderNameTagEvent, ScreenCharTypedPreEvent, ScreenMouseButtonPressedPreEvent, ScreenMouseButtonReleasedPreEvent, ScreenMouseScrolledPreEvent, ScreenRenderPostEvent,
     ServerboundPlayPacket, TickEvent,
 };
 use std::collections::HashSet;
@@ -81,6 +83,16 @@ struct State {
     /// последним сообщили.
     svc: bool,
     svc_state_sent: Option<(bool, bool)>,
+    /// Версия SVC текущей сессии (`svc::V26` / `svc::V27`): от неё раскладка состояний и своё состояние.
+    svc_version: i32,
+    /// Plasmo: какие (звук выключен, микрофон выключен) мы последний раз сообщили серверу.
+    plasmo_state_sent: Option<(bool, bool)>,
+    /// Версия SVC, которой отвечает сервер: узнаём по его «несовместимая версия» в чате на другую.
+    svc_version_lock: Option<i32>,
+    /// С какой версией ушёл последний запрос ключа.
+    svc_last_request: i32,
+    /// Голос SVC идёт через сервер Horizon: сообщения завёрнуты в `horizon:mod_net`.
+    svc_mod_net: bool,
 }
 
 impl State {
@@ -104,6 +116,11 @@ impl State {
             stale_logged: false,
             svc: false,
             svc_state_sent: None,
+            svc_version: svc::V26,
+            plasmo_state_sent: None,
+            svc_version_lock: None,
+            svc_last_request: svc::V26,
+            svc_mod_net: false,
         };
         settings::load();
         voice::reset_log(log_path());
@@ -116,7 +133,11 @@ impl State {
     fn restart_handshake(&mut self) {
         self.svc = false;
         self.svc_state_sent = None;
+        self.plasmo_state_sent = None;
+        self.svc_mod_net = false;
         settings::set_protocol("");
+        settings::set_server_has_groups(false);
+        settings::set_server_has_world(false);
         self.voice = None; // Drop останавливает рабочий поток и закрывает аудио
         self.stale_logged = false;
         self.aes_key = None;
@@ -136,7 +157,9 @@ impl State {
         self.stale_resets = 0;
         self.seen_channels.clear(); // чтобы в логе снова было видно, какие каналы объявил новый сервер
         self.outbox.lock_ok().clear();
+        self.svc_version_lock = None;
         roster::reset(); // игроки и источники голоса прошлого сервера
+        groups::reset(); // группы прошлого сервера
         aim::reset();
         faces::reset();
         spatial::reset();
@@ -177,12 +200,40 @@ fn custom_payload(channel: &str, data: &[u8]) -> Option<ServerboundPlayPacket> {
     }
 }
 
+/// Активации мода для сервера SVC (сам сервер их не знает, это только наши рации).
+fn svc_activations(distance: f64, groups: bool) -> Vec<plasmo::Activation> {
+    let act = |name: &str, proximity: bool, weight: i32| plasmo::Activation {
+        name: name.to_string(),
+        translation: format!("pv.activation.{name}"),
+        id: plasmo::activation_id(name),
+        distances: Vec::new(),
+        default_distance: distance.clamp(0.0, i16::MAX as f64) as i32,
+        proximity,
+        transitive: true,
+        stereo: false,
+        weight,
+    };
+    let mut v = vec![act(settings::PROXIMITY, true, 1)];
+    if groups {
+        v.push(act("groups", false, 10));
+    }
+    v
+}
+
+/// Сообщение SVC серверу: по своему каналу или, на сервере Horizon, внутри `horizon:mod_net`.
+fn svc_payload(mod_net: bool, channel: &str, data: &[u8]) -> Option<ServerboundPlayPacket> {
+    if mod_net { custom_payload(svc::MOD_NET, &svc::mod_net_wrap(channel, data)) } else { custom_payload(channel, data) }
+}
+
 /// Пакеты Simple Voice Chat (`voicechat:*`): ключ сессии и состояния игроков.
-fn on_svc_packet(st: &mut State, host: &dyn Host, channel: &str, data: &[u8]) {
+/// `mod_net` — сообщение пришло от сервера голоса Horizon (внутри `horizon:mod_net`).
+fn on_svc_packet(st: &mut State, host: &dyn Host, channel: &str, data: &[u8], mod_net: bool) {
     match channel {
         svc::CH_SECRET => {
-            let Some(secret) = svc::parse_secret(data) else {
-                st.log("SVC secret: не разобрался");
+            // сервер Horizon говорит только на 2.6; у обычного SVC версию видно по раскладке ключа
+            let parsed = if mod_net { svc::parse_secret_v26(data) } else { svc::parse_secret(data) };
+            let Some(secret) = parsed else {
+                st.log(&format!("SVC secret: не разобрался ({} байт): {}", data.len(), plasmo::hex_prefix(data, 96)));
                 return;
             };
             if st.connected && !st.svc {
@@ -193,22 +244,37 @@ fn on_svc_packet(st: &mut State, host: &dyn Host, channel: &str, data: &[u8]) {
             // адрес голоса: свой хост из конфига сервера SVC или адрес игрового сервера
             let server = host.client_state().and_then(|s| s.server_address).unwrap_or_else(|| "127.0.0.1".to_string());
             let (vhost, port) = svc::voice_address(&secret, &server);
+            let kind = match (mod_net, secret.version) {
+                (true, _) => "сервер Horizon",
+                (false, svc::V26) => "SVC 2.6",
+                _ => "SVC 2.7",
+            };
             st.log(&format!(
-                "SVC secret: голос {vhost}:{port}, дистанция {}, кодек {}, mtu {}, keep-alive {} мс, группы {}",
+                "SVC secret ({kind}): голос {vhost}:{port}, дистанция {}, кодек {}, mtu {}, keep-alive {} мс, группы {}",
                 secret.distance, secret.codec, secret.mtu, secret.keep_alive, secret.groups
             ));
             st.voice = None; // старая сессия (если была) закрывается
             st.svc = true;
             st.svc_state_sent = None;
+            st.svc_version = secret.version;
+            st.svc_mod_net = mod_net;
             st.connected = true;
-            settings::set_protocol("Simple Voice Chat");
-            settings::reset_activations(); // у SVC нет активаций Plasmo: голос рядом, как «Локальный»
+            settings::set_protocol(match (mod_net, secret.version) {
+                (true, _) => "Horizon (Simple Voice Chat 2.6)",
+                (false, svc::V26) => "Simple Voice Chat 2.6",
+                _ => "Simple Voice Chat 2.7",
+            });
+            settings::set_server_has_groups(secret.groups);
+            settings::set_server_has_world(false);
+            // У SVC нет активаций Plasmo; свои: «Локальный» и, если на сервере есть группы, «Группы» —
+            // отдельная рация, которая говорит, пока вы в группе (voice.rs)
+            settings::set_server_activations(svc_activations(secret.distance, secret.groups));
             settings::set_distance(secret.distance.max(0.0) as u32);
             let logger = voice::file_logger(log_path(), st.start);
             let link = voice::Link::Svc {
                 host: vhost,
                 port,
-                session: svc::Session::new(&secret.key, secret.connection_id),
+                session: svc::Session::from_secret(&secret),
                 keep_alive_ms: secret.keep_alive,
             };
             let v = voice::start(link, Arc::clone(&st.outbox), logger);
@@ -220,18 +286,32 @@ fn on_svc_packet(st: &mut State, host: &dyn Host, channel: &str, data: &[u8]) {
             });
             st.voice = Some(v);
         }
-        svc::CH_STATES => match svc::parse_states(data) {
+        svc::CH_STATES => match svc::parse_states(data, st.svc_version) {
             Some(list) => roster::on_svc_states(&list),
             None => st.log("SVC states: не разобрался"),
         },
         svc::CH_STATE => {
-            if let Some(s) = svc::parse_state(data) {
+            if let Some(s) = svc::parse_state(data, st.svc_version) {
                 roster::on_svc_state(&s);
             }
         }
         svc::CH_REMOVE_STATE => {
             if let Some(id) = svc::parse_remove_state(data) {
                 roster::on_svc_remove(id);
+            }
+        }
+        svc::CH_ADD_GROUP => match svc::parse_add_group(data) {
+            Some(g) => groups::on_svc_add_group(g),
+            None => st.log("SVC add_group: не разобрался"),
+        },
+        svc::CH_REMOVE_GROUP => {
+            if let Some(id) = svc::parse_remove_group(data) {
+                groups::on_svc_remove_group(id);
+            }
+        }
+        svc::CH_JOINED_GROUP => {
+            if let Some((group, wrong)) = svc::parse_joined_group(data) {
+                groups::on_svc_joined(group, wrong);
             }
         }
         _ => {}
@@ -375,7 +455,7 @@ impl Hooks for Mod {
         // успевает плавно погаснуть, когда игрок замолчал.
         if nametag::overlay_ok() {
             if let Some(pos) = host.entity(event.entity_id).and_then(|e| e.position(host)) {
-                nametag::note(&name, pos, nametag::is_sneaking(host, event.entity_id));
+                nametag::note(&name, event.entity_id, pos, nametag::is_sneaking(host, event.entity_id));
                 return;
             }
         }
@@ -404,12 +484,19 @@ impl Hooks for Mod {
         if settings::connected() {
             spatial::update(&*host);
         }
-        menu::ROUTED_COUNT.store(spatial::routed_count() as u32, std::sync::atomic::Ordering::Relaxed);
         // Проверка звука работает, только пока открыто меню: закрыли его (Esc) — выключаем, иначе эхо.
         if settings::mic_test() && !menu::is_live() {
             settings::set_mic_test(false);
         }
         let mut st = self.state.lock_ok();
+        // Без голосового сервера (одиночный мир, сервер без плагина) список устройств читаем сами, в фоне:
+        // микрофон и наушники можно выбрать заранее, и они понадобятся на первом же сервере с голосом.
+        if st.voice.is_none() && settings::take_mic_refresh() {
+            std::thread::spawn(|| {
+                settings::set_mic_list(voice::input_names());
+                settings::set_out_list(voice::output_names());
+            });
+        }
         if st.open_ticks > 0 {
             st.open_ticks -= 1;
             if menu::is_live() {
@@ -418,13 +505,57 @@ impl Hooks for Mod {
                 host.mod_screen_open(MOD_ID);
             }
         }
+        // свой ник: игрок среди сущностей там же, где вы (нужно меню групп: себя не зовут)
+        static NAME_TICK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = NAME_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if settings::self_name().is_empty() || n % 100 == 0 {
+            if let Some(me) = host.player() {
+                let near = host.client_entities().into_iter().find(|e| {
+                    let d = [e.position[0] - me.x, e.position[1] - me.y, e.position[2] - me.z];
+                    e.player_name.is_some() && d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < 0.01
+                });
+                if let Some(name) = near.and_then(|e| e.player_name) {
+                    settings::set_self_name(&name);
+                }
+            }
+        }
+        // Группы Plasmo (pv-addon-groups): команды кнопок меню и запрос списка групп
+        // и группы Simple Voice Chat: пакеты create_group / set_group / leave_group
+        groups::svc_tick(); // SVC: «Локальный» в обычной группе — временно выйти из неё и вернуться
+        for a in groups::take_actions() {
+            match a {
+                groups::Action::Command(c) => {
+                    if let Err(e) = host.send_chat(&format!("/{c}")) {
+                        st.log(&format!("группы: команда /{c} не ушла: {e}"));
+                    }
+                }
+                groups::Action::Svc(ch, data) => {
+                    let sent = st.svc && svc_payload(st.svc_mod_net, ch, &data).is_some_and(|pk| host.send_packet(pk).is_ok());
+                    if !sent {
+                        st.log(&format!("группы SVC: {ch} не ушёл"));
+                    }
+                }
+            }
+        }
         // SVC: сообщаем серверу, выключены ли у нас микрофон и голос (он показывает это другим игрокам)
         if st.svc && st.connected {
             let now = (settings::mic_muted() || settings::mic_off(), settings::voice_off());
             if st.svc_state_sent != Some(now) {
-                if let Some(pk) = custom_payload(svc::CH_CLIENT_STATE, &svc::client_state(now.0, now.1)) {
+                let (ch, body) = svc::own_state(st.svc_version, now.0, now.1);
+                if let Some(pk) = svc_payload(st.svc_mod_net, ch, &body) {
                     if host.send_packet(pk).is_ok() {
                         st.svc_state_sent = Some(now);
+                    }
+                }
+            }
+        }
+        // Plasmo: то же самое пакетом PlayerState (иначе другие не видят, что у нас выключен звук или микрофон)
+        if st.sent && st.connected && !st.svc && st.voice.is_some() {
+            let now = (settings::voice_off(), settings::mic_muted() || settings::mic_off());
+            if st.plasmo_state_sent != Some(now) {
+                if let Some(pk) = custom_payload(plasmo::CHANNEL, &plasmo::player_state_packet(now.0, now.1)) {
+                    if host.send_packet(pk).is_ok() {
+                        st.plasmo_state_sent = Some(now);
                     }
                 }
             }
@@ -449,12 +580,18 @@ impl Hooks for Mod {
             }
             // UDP молчит дольше STALE_AFTER: сервер забыл нашу сессию (например, после смены бэкенда,
             // которую мы не заметили). Просим новую: register + PlayerInfo, и ждём свежий Connection.
-            if st.connected && st.stale_resets < MAX_STALE_RESETS && st.voice.as_ref().is_some_and(|v| v.is_stale()) {
+            // У SVC так нельзя: сервер выдаёт ключ один раз за вход («already requested secret»), и новый
+            // хендшейк только рвёт рабочую сессию. Тихий UDP у SVC — почти всегда закрытый порт на хостинге.
+            if st.svc && st.connected && !st.stale_logged && st.voice.as_ref().is_some_and(|v| v.is_stale()) {
+                st.stale_logged = true;
+                st.log("SVC: UDP молчит — сессию не пересоздаю (сервер второй ключ не выдаст); вероятно, порт голоса закрыт для UDP");
+                settings::notice("Сервер голоса не отвечает: порт UDP закрыт?");
+            } else if st.connected && !st.svc && st.stale_resets < MAX_STALE_RESETS && st.voice.as_ref().is_some_and(|v| v.is_stale()) {
                 st.stale_resets += 1;
                 let n = st.stale_resets;
                 st.log(&format!("UDP молчит: запрашиваю сессию заново (#{n} из {MAX_STALE_RESETS})"));
                 st.restart_handshake();
-            } else if st.voice.as_ref().is_some_and(|v| v.is_stale()) && !st.stale_logged {
+            } else if !st.svc && st.voice.as_ref().is_some_and(|v| v.is_stale()) && !st.stale_logged {
                 // UDP молчит, а пересоздать сессию нельзя: в логе будет видно почему.
                 st.stale_logged = true;
                 let (connected, resets) = (st.connected, st.stale_resets);
@@ -477,15 +614,23 @@ impl Hooks for Mod {
                     let ok = custom_payload(plasmo::CHANNEL, &info)
                         .map(|pk| host.send_packet(pk).is_ok())
                         .unwrap_or(false);
-                    // и Simple Voice Chat: просим ключ (сервер без SVC просто промолчит)
-                    let svc_ok = custom_payload(svc::CH_REQUEST_SECRET, &svc::request_secret(svc::COMPATIBILITY_VERSION))
+                    // и Simple Voice Chat: просим ключ (сервер без SVC просто промолчит). Версии по очереди:
+                    // SVC отвечает только своей.
+                    let ver = st.svc_version_lock.unwrap_or_else(|| svc::request_version(n));
+                    st.svc_last_request = ver;
+                    let svc_ok = custom_payload(svc::CH_REQUEST_SECRET, &svc::request_secret(ver))
+                        .map(|pk| host.send_packet(pk).is_ok())
+                        .unwrap_or(false);
+                    // и серверу голоса Horizon: те же сообщения внутри horizon:mod_net, всегда версия 2.6
+                    let hz_ok = svc_payload(true, svc::CH_REQUEST_SECRET, &svc::request_secret(svc::V26))
                         .map(|pk| host.send_packet(pk).is_ok())
                         .unwrap_or(false);
                     st.log(&format!(
-                        "хендшейк #{n}: minecraft:register {}, PlayerInfo {}, SVC request_secret {}",
+                        "хендшейк #{n}: minecraft:register {}, PlayerInfo {}, SVC request_secret v{ver} {}, Horizon {}",
                         if reg_ok { "ушёл" } else { "не ушёл" },
                         if ok { "ушёл" } else { "не ушёл" },
-                        if svc_ok { "ушёл" } else { "не ушёл" }
+                        if svc_ok { "ушёл" } else { "не ушёл" },
+                        if hz_ok { "ушёл" } else { "не ушёл" }
                     ));
                 }
             }
@@ -534,7 +679,19 @@ impl Hooks for Mod {
             st.log(&format!("сервер регистрирует каналы: {:?}", list));
         }
         if p.channel.starts_with("voicechat:") {
-            on_svc_packet(&mut st, &*host, &p.channel, &p.data);
+            on_svc_packet(&mut st, &*host, &p.channel, &p.data, false);
+            return;
+        }
+        // Сервер голоса Horizon: сообщения SVC внутри канала модов Horizon (игра тоже его читает, мы — копию)
+        if p.channel == svc::MOD_NET {
+            if let Some((ch, data)) = svc::mod_net_unwrap(&p.data) {
+                if ch.starts_with("voicechat:") {
+                    if st.seen_channels.insert(format!("{} / {ch}", svc::MOD_NET)) {
+                        st.log(&format!("сервер Horizon: {ch}"));
+                    }
+                    on_svc_packet(&mut st, &*host, &ch, &data, true);
+                }
+            }
             return;
         }
         if p.channel != plasmo::CHANNEL {
@@ -586,15 +743,28 @@ impl Hooks for Mod {
                 roster::on_player_update(&data[1..]);
             }
             16 => {
-                roster::on_source_info(&data[1..]);
+                if !roster::on_source_info(&data[1..]) {
+                    st.log(&format!("SourceInfo не разобран ({} байт)", data.len()));
+                } else if let Some(src) = data.get(1..).and_then(roster::world_source_note) {
+                    // звуки мира в лог: по ним видно, что пластинка дошла до клиента
+                    st.log(&src);
+                }
             }
             // Connection: адрес и секрет UDP. Запускаем (заново) голосовой поток.
             1 => match plasmo::parse_connection(&data[1..]) {
                 Some(_) if st.svc => st.log("Connection Plasmo пропускаю: голос уже идёт через Simple Voice Chat"),
-                Some(c) => {
+                Some(mut c) => {
                     settings::set_protocol("Plasmo Voice");
                     st.connected = true;
-                    st.log(&format!("Connection: udp {}:{}", c.ip, c.port));
+                    // «0.0.0.0» — сервер слушает все адреса: голос идёт на адрес игрового сервера
+                    let server = host.client_state().and_then(|s| s.server_address).unwrap_or_else(|| "127.0.0.1".to_string());
+                    let ip = plasmo::udp_host(&c.ip, &server);
+                    if ip != c.ip {
+                        st.log(&format!("Connection: udp {}:{} -> {ip}:{} (адрес игрового сервера)", c.ip, c.port, c.port));
+                    } else {
+                        st.log(&format!("Connection: udp {}:{}", c.ip, c.port));
+                    }
+                    c.ip = ip;
                     let logger = voice::file_logger(log_path(), st.start);
                     st.voice = Some(voice::start(voice::Link::Plasmo(c), Arc::clone(&st.outbox), logger));
                 }
@@ -609,6 +779,8 @@ impl Hooks for Mod {
                     ));
                     st.log(&format!("Config: активации {:?}, разбор: {}", cfg.activation_names, cfg.activations_note));
                     settings::set_server_activations(cfg.activations.clone());
+                    st.log(&format!("Config: линии {:?}", cfg.line_names));
+                    settings::note_server_lines(&cfg.line_names);
                     match st.key.decrypt_pkcs1(&cfg.aes_key_encrypted) {
                         Some(k) if k.len() == 16 => {
                             let mut a = [0u8; 16];
@@ -652,12 +824,16 @@ impl Hooks for Mod {
         if settings::nametags_on() {
             nametag::draw(&*host, &mut *event.batch, right + 2.0, bottom + 2.0);
         }
+        // ноты над играющей пластинкой (звуки мира)
+        notes::draw(&*host, &mut *event.batch, right + 2.0, bottom + 2.0);
         let gui_w = right as i32 + 2;
         let gui_h = bottom as i32 + 2;
-        // «Ник: 120%» под прицелом после ПКМ + колесо.
-        if settings::volume_toast().is_some() {
+        // громкость игрока после ПКМ + колесо: над его ником (или под прицелом)
+        if let Some((nick, _, _)) = settings::volume_toast() {
+            // над ником игрока, если он на экране
+            let tag = nametag::tag_top(&*host, &nick, right + 2.0, bottom + 2.0).map(|(x, y)| (x.round() as i32, y.round() as i32));
             let mut gui = Gui { host: &*host, batch: &mut *event.batch };
-            menu::draw_volume_toast(&mut gui, gui_w, gui_h);
+            menu::draw_volume_toast(&mut gui, gui_w, gui_h, tag);
         }
         // «Микрофон выключен», «Дистанция: 32» после клавиш действий
         {
@@ -668,6 +844,9 @@ impl Hooks for Mod {
         {
             let mut gui = Gui { host: &*host, batch: &mut *event.batch };
             menu::draw_speakers(&mut gui, gui_w, gui_h);
+        }
+        if !settings::hotbar_icon_on() {
+            return;
         }
         let Some((w, h)) = menu::overlay_size() else { return };
         // Иконка по центру хотбара: между сердечками и едой, над рядом сердечек (ряд сердечек: 39 пикселей от низа).
@@ -719,6 +898,33 @@ impl Hooks for Mod {
     }
 
     /// Каждый кадр, пока открыт экран мода: рисуем меню (экраны других мест игры пропускаем).
+    /// Набранный символ в меню мода (любые буквы, в том числе русские): поля вкладки «Группы».
+    fn screen_char_typed_pre(&self, _host: &dyn Host, event: &mut ScreenCharTypedPreEvent<'_>) -> Flow {
+        if event.screen.id == "mod" && menu::on_char(event.c) {
+            return Flow::Cancel;
+        }
+        Flow::Continue
+    }
+
+    /// Сообщение чата: ответ сервера на наш запрос списка групп (`/groups browse`) мод читает сам и прячет.
+    fn client_chat_received(&self, _host: &mut dyn Host, event: &mut ClientChatReceivedEvent<'_>) -> Flow {
+        // Сервер SVC на запрос ключа не той версии пишет игроку в чат: прячем это и дальше просим
+        // только версию сервера (мы пробуем обе по очереди, потому что заранее её не знаем).
+        if event.system && svc::is_incompatible_notice(&groups::plain(event.message)) {
+            let mut st = self.state.lock_ok();
+            if st.svc_version_lock.is_none() {
+                let v = svc::other_version(st.svc_last_request);
+                st.svc_version_lock = Some(v);
+                st.log(&format!("SVC: сервер не принял версию {}, дальше прошу только {v}", st.svc_last_request));
+            }
+            return Flow::Cancel;
+        }
+        if event.system && !event.overlay && groups::on_chat(event.message, menu::is_live()) {
+            return Flow::Cancel;
+        }
+        Flow::Continue
+    }
+
     fn screen_render_post(&self, host: &dyn Host, event: &mut ScreenRenderPostEvent<'_>) {
         if event.screen.id != "mod" {
             return;
