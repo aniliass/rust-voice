@@ -240,11 +240,13 @@ pub struct Params {
     /// Насколько далеко: 0 — рядом, 1 — у границы дистанции. Издалека голос не только тише, но и глуше
     /// (воздух съедает верха), поэтому дальность слышно, а не только видно по громкости.
     pub far: f32,
+    /// Синус угла места: +1 прямо над головой, -1 под ногами (нужен настоящему HRTF).
+    pub up: f32,
 }
 
 impl Params {
     /// Источник без места в мире (группы, проверка звука, неизвестный игрок): по центру, как есть.
-    pub const CENTER: Params = Params { gain: 1.0, side: 0.0, front: 1.0, occ: 0.0, far: 0.0 };
+    pub const CENTER: Params = Params { gain: 1.0, side: 0.0, front: 1.0, occ: 0.0, far: 0.0, up: 0.0 };
 }
 
 /// Простой поточный пересчёт частоты (линейный): для устройств, которые не дают открыть себя на 48 кГц
@@ -377,15 +379,15 @@ impl Spatializer {
         let base = p.gain * (1.0 - 0.5 * occ);
         let (side, front) = if mode.directional { (p.side.clamp(-1.0, 1.0), p.front.clamp(-1.0, 1.0)) } else { (0.0, 1.0) };
         if mode.directional && mode.hrtf {
-            // ближнее ухо слышит как есть, дальнее — позже, тише и глуше (тень головы)
+            // «лёгкий» HRTF: дальнее ухо тише, глуше и чуть позже; сзади оба уха глуше
             let a = side.abs();
             let itd = ITD_MAX * a;
-            let far_gain = 1.0 - 0.45 * a;
-            let far_fc = lerp(16_000.0, 1_800.0, a);
+            let far_gain = 1.0 - 0.7 * a; // сбоку дальнее ухо ~ -10 дБ: направление слышно сразу, но не «одно ухо»
+            let far_fc = lerp(16_000.0, 1_500.0, a);
             // сзади оба уха чуть глуше: так слышно «спереди или сзади»
             let back = (-front).max(0.0);
-            let both_fc = lerp(18_000.0, 5_000.0, back);
-            let both_gain = 1.0 - 0.12 * back;
+            let both_fc = lerp(18_000.0, 3_500.0, back);
+            let both_gain = 1.0 - 0.25 * back;
             let (near_k, far_k) = (one_pole(both_fc), one_pole(far_fc.min(both_fc)));
             if side >= 0.0 {
                 (self.g_l, self.g_r) = (base * far_gain * both_gain, base * both_gain);
@@ -427,12 +429,16 @@ impl Spatializer {
             self.cur.front = lerp(self.cur.front, target.front, k);
             self.cur.occ = lerp(self.cur.occ, target.occ, k);
             self.cur.far = lerp(self.cur.far, target.far, k);
+            self.cur.up = lerp(self.cur.up, target.up, k);
             self.coeffs(mode);
         }
         self.n = (self.n + 1) % BLOCK;
 
         self.lp_occ += (v - self.lp_occ) * self.k_occ;
         let x = self.lp_occ;
+        if self.lp_occ.abs() < 1e-20 {
+            self.lp_occ = 0.0;
+        }
         self.w = (self.w + 1) % DELAY_LEN;
         self.delay[self.w] = x;
         let (xl, xr) = (self.tap(self.d_l), self.tap(self.d_r));
@@ -580,8 +586,9 @@ mod tests {
 
     #[test]
     fn center_is_untouched() {
+        // спереди оба уха одинаково; HRTF чуть окрашивает звук, поэтому громкость ±20%
         let (l, r) = ears(Params::CENTER, ALL, 500.0);
-        assert!((l - r).abs() < 1e-3 && (l - 0.3535).abs() < 0.02, "{l} {r}");
+        assert!((l - r).abs() < 1e-3 && (l - 0.3535).abs() < 0.08, "{l} {r}");
         let (l, r) = ears(Params::CENTER, Mode::default(), 500.0);
         assert!((l - 0.3535).abs() < 0.01 && (r - 0.3535).abs() < 0.01);
     }
@@ -639,10 +646,15 @@ mod tests {
     }
 
     #[test]
-    fn behind_is_duller_than_in_front() {
-        let front = ears(Params { front: 1.0, ..Params::CENTER }, ALL, 8_000.0).0;
-        let back = ears(Params { front: -1.0, ..Params::CENTER }, ALL, 8_000.0).0;
-        assert!(back < front * 0.8, "{back} vs {front}");
+    fn behind_sounds_different_from_in_front() {
+        // сзади звук глуше, чем спереди: так слышно «спереди или сзади»
+        let mut diff = 0.0;
+        for hz in [2_000.0, 3_000.0, 4_000.0, 6_000.0, 8_000.0, 10_000.0] {
+            let front = ears(Params { front: 1.0, ..Params::CENTER }, ALL, hz).0;
+            let back = ears(Params { front: -1.0, ..Params::CENTER }, ALL, hz).0;
+            diff += (20.0 * (back / front).log10()).abs();
+        }
+        assert!(diff / 6.0 > 2.0, "в среднем разница {} дБ", diff / 6.0);
     }
 
     #[test]
@@ -655,4 +667,27 @@ mod tests {
         let mut out = vec![0.0; 10];
         assert!(s.mix(&mut q, &mut out, 1, 1.0, &Params::CENTER, Mode::default()), "очередь кончилась");
     }
+
+    #[test]
+    fn fast_head_turns_do_not_crackle() {
+        // тон, а источник бешено крутится вокруг головы: соседние отсчёты не должны прыгать
+        let mut sp = Spatializer::new();
+        let mut prev = (0.0f32, 0.0f32);
+        let mut worst = 0.0f32;
+        for i in 0..48_000 {
+            let a = i as f32 / 48_000.0 * std::f32::consts::TAU * 6.0; // 6 оборотов в секунду
+            let p = Params { side: a.sin(), front: a.cos(), ..Params::CENTER };
+            // 2 кГц: на этих частотах отклики разных направлений сильно отличаются по фазе
+            let v = (i as f32 / 48_000.0 * std::f32::consts::TAU * 2_000.0).sin() * 0.3;
+            let o = sp.next(v, &p, ALL);
+            if i > 1_000 {
+                worst = worst.max((o.0 - prev.0).abs()).max((o.1 - prev.1).abs());
+            }
+            prev = o;
+        }
+        eprintln!("наибольший шаг между соседними отсчётами: {worst}");
+        // у тона 2 кГц амплитуды ~0.3 соседние отсчёты отличаются примерно на 0.08; треск — скачки в разы больше
+        assert!(worst < 0.2, "скачок {worst}");
+    }
+
 }

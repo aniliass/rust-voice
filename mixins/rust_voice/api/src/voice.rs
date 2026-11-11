@@ -7,7 +7,7 @@ use cpal::{BufferSize, SampleRate, StreamConfig};
 use rusty_opus::{Application, OpusDecoder, OpusEncoder, SignalType};
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
-use std::net::UdpSocket;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -15,6 +15,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub const RATE: u32 = 48_000;
 /// 20 мс при 48 кГц, моно.
 pub const FRAME: usize = 960;
+/// Активация нейросетью: с какой уверенности в речи включаемся и до какой держимся; тише `VAD_FLOOR`
+/// (около −56 дБ) — никогда (нейросеть иногда видит «речь» в почти тишине).
+const VAD_START: f32 = 0.6;
+const VAD_KEEP: f32 = 0.3;
+const VAD_FLOOR: f32 = 0.0016;
 const MAX_QUEUE: usize = RATE as usize; // не больше секунды в очереди
 const PREFILL_FRAMES: usize = 3; // сколько кадров копим перед воспроизведением источника
 /// Сколько UDP может молчать, прежде чем сессия считается мёртвой (сервер шлёт keep-alive раз в 2-4 с).
@@ -85,14 +90,40 @@ pub enum Link {
 impl Link {
     fn addr(&self) -> String {
         match self {
-            Link::Plasmo(c) => format!("{}:{}", c.ip, c.port),
+            Link::Plasmo(c) => host_port(&c.ip, c.port),
             // сокет нужен коду ниже, но в него ничего не пишем
             Link::Offline => "127.0.0.1:9".to_string(),
-            Link::Svc { host, port, .. } => {
-                if host.contains(':') { format!("[{host}]:{port}") } else { format!("{host}:{port}") }
-            }
+            Link::Svc { host, port, .. } => host_port(host, port),
         }
     }
+}
+
+/// «адрес:порт» для UDP. IPv6 — в квадратных скобках, иначе двоеточия адреса спутаются с портом.
+fn host_port(host: &str, port: impl std::fmt::Display) -> String {
+    let h = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if h.contains(':') { format!("[{h}]:{port}") } else { format!("{h}:{port}") }
+}
+
+/// Локальный адрес того же семейства, что и сервер: IPv4-сокет (`0.0.0.0`) до IPv6-сервера не достучится.
+fn local_bind_addr(remote: &SocketAddr) -> SocketAddr {
+    match remote {
+        SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+        SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+    }
+}
+
+/// UDP-сокет к серверу голоса: сначала узнаём адрес (имя может дать и IPv4, и IPv6), потом открываем
+/// сокет под его семейство. Пробуем адреса по очереди, пока какой-нибудь не подойдёт.
+fn connect_udp(addr: &str) -> Result<UdpSocket, String> {
+    let targets = addr.to_socket_addrs().map_err(|e| format!("адрес {addr}: {e}"))?;
+    let mut last = format!("адрес {addr}: не нашёлся");
+    for t in targets {
+        match UdpSocket::bind(local_bind_addr(&t)).and_then(|s| s.connect(t).map(|_| s)) {
+            Ok(s) => return Ok(s),
+            Err(e) => last = format!("connect {t}: {e}"),
+        }
+    }
+    Err(last)
 }
 
 /// Запускает рабочий поток для новой UDP-сессии. Старый поток остановится, когда его `VoiceCtl` уничтожат.
@@ -247,11 +278,28 @@ struct SrcQueue {
     sp: dsp::Spatializer,
     /// Голос привязан к месту в мире (игрок рядом). Группа SVC — нет: звучит ровно, по центру.
     positional: bool,
+    /// Действует ползунок «Локальный»: голоса рядом и проверка звука. Не группы и не звуки мира —
+    /// у них свои ползунки.
+    local: bool,
 }
 
 impl SrcQueue {
     fn new(gain: f32) -> SrcQueue {
-        SrcQueue { q: VecDeque::new(), started: false, gain, nick: None, max_dist: 0.0, sp: dsp::Spatializer::new(), positional: true }
+        SrcQueue {
+            q: VecDeque::new(),
+            started: false,
+            gain,
+            nick: None,
+            max_dist: 0.0,
+            sp: dsp::Spatializer::new(),
+            positional: true,
+            local: false,
+        }
+    }
+
+    /// Громкость с учётом ползунка «Локальный» (`local_vol`), если он к этому источнику относится.
+    fn effective_gain(&self, local_vol: f32) -> f32 {
+        if self.local { self.gain * local_vol } else { self.gain }
     }
 }
 
@@ -279,6 +327,10 @@ struct Audio {
     /// SVC: голос, придержанный, пока мод выходит из группы или возвращается в неё.
     svc_hold: Vec<Vec<f32>>,
     speaking: bool,
+    /// Активация нейросетью: сейчас «говорим» (гистерезис: включаемся увереннее, чем выключаемся).
+    vad_open: bool,
+    /// Уверенность нейросети в прошлом кадре: включаемся, только если речь два кадра подряд (щелчок — один).
+    vad_prev: f32,
     /// Когда передавать: предзапись, гистерезис, мягкие края (`dsp::Gate`).
     gate: dsp::Gate,
     /// Какой по счёту профиль шума уже применён (settings::noise_profile_gen).
@@ -286,6 +338,8 @@ struct Audio {
     packet: [u8; 1500],
     /// Шумоподавление микрофона (сила в настройках, 0 — выключено).
     ns: denoise::Denoiser,
+    /// Шумодав нейросетью (RNNoise), если он выбран в меню.
+    rnn: Option<crate::rnnoise::Rnnoise>,
     /// Фильтр гула и автогромкость (переключатели во вкладке «Устройства»).
     hum: dsp::HighPass,
     agc: dsp::Agc,
@@ -651,6 +705,7 @@ fn mix_output(play: &Arc<Mutex<Queues>>, data: &mut [f32], channels: usize) {
         hrtf: settings::hrtf_on(),
         occlusion: settings::occlusion_on(),
     };
+    let (vol, off) = (settings::voice_volume(), settings::voice_off());
     let mut qs = play.lock_ok();
     for src in qs.by_source.values_mut() {
         if !src.started {
@@ -665,16 +720,19 @@ fn mix_output(play: &Arc<Mutex<Queues>>, data: &mut [f32], channels: usize) {
         } else {
             dsp::Params::CENTER
         };
-        if src.sp.mix(&mut src.q, data, channels, src.gain, &target, mode) {
+        // голос без места (группа, проверка звука) — по центру и без HRTF: окраска ушей ему ни к чему
+        let m = if src.positional { mode } else { dsp::Mode { directional: false, ..mode } };
+        // «Локальный» — только голосам рядом: группы и музыку он не трогает (у них свои ползунки)
+        let gain = src.effective_gain(vol);
+        if src.sp.mix(&mut src.q, data, channels, gain, &target, m) {
             src.started = false;
         }
     }
-    // игрока, которого вы заглушили до 0%, «слышно» не считаем
-    settings::set_hearing(qs.by_source.values().filter(|e| e.started && e.gain > 0.0).count() as u32);
+    // игрока, которого вы заглушили до 0% (им самим или «Локальным»), «слышно» не считаем
+    settings::set_hearing(qs.by_source.values().filter(|e| e.started && e.effective_gain(vol) > 0.0).count() as u32);
     drop(qs);
-    let (vol, off) = (settings::voice_volume(), settings::voice_off());
     for v in data.iter_mut() {
-        *v = if off { 0.0 } else { dsp::soft_limit(*v * vol).clamp(-1.0, 1.0) };
+        *v = if off { 0.0 } else { dsp::soft_limit(*v).clamp(-1.0, 1.0) };
     }
 }
 
@@ -722,6 +780,8 @@ impl Audio {
             svc_seq: 0,
             svc_hold: Vec::new(),
             speaking: false,
+            vad_open: false,
+            vad_prev: 0.0,
             gate: dsp::Gate::new(),
             profile_gen: settings::noise_profile_gen(),
             packet: [0u8; 1500],
@@ -730,6 +790,7 @@ impl Audio {
                 d.set_profile(settings::noise_profile());
                 d
             },
+            rnn: None,
             hum: dsp::HighPass::new(80.0),
             agc: dsp::Agc::new(),
         }
@@ -762,6 +823,7 @@ impl Audio {
             self._in_stream = None; // старый поток закрываем до открытия нового
             self.mic.lock_ok().clear();
             self.ns.reset();
+            self.rnn = None;
             self.hum.reset();
             self.agc.reset();
             self.gate.reset();
@@ -797,7 +859,19 @@ impl Audio {
                     settings::set_learn_progress(self.ns.learning());
                 }
             }
-            self.ns.process(&mut frame, noise);
+            // шумодав: нейросеть RNNoise (как в Plasmo) или своё спектральное; переключение — с чистого листа.
+            // Нейросеть нужна и для активации по голосу: тогда она идёт всегда (без шумодава — только слушает).
+            let ai_clean = settings::noise_ai() && noise > 0.0;
+            if ai_clean || settings::vad_ai() {
+                let r = self.rnn.get_or_insert_with(crate::rnnoise::Rnnoise::new);
+                r.process(&mut frame, if ai_clean { noise } else { 0.0 });
+                settings::set_speech(r.vad());
+                self.ns.process(&mut frame, if ai_clean { 0.0 } else { noise });
+            } else {
+                self.rnn = None;
+                settings::set_speech(0.0);
+                self.ns.process(&mut frame, noise);
+            }
             if (gain - 1.0).abs() > f32::EPSILON {
                 for v in frame.iter_mut() {
                     *v = (*v * gain).clamp(-1.0, 1.0);
@@ -805,10 +879,20 @@ impl Audio {
             }
             let rms = (frame.iter().map(|s| s * s).sum::<f32>() / FRAME as f32).sqrt();
             settings::set_level(rms); // меню рисует по нему полосу уровня
-            let loud = rms >= threshold;
+            // Активация: по нейросети (речь ли это, а не громко ли) или по порогу в дБ.
+            let (loud, by_ai) = if settings::vad_ai() {
+                let p = settings::speech();
+                let on = rms >= VAD_FLOOR && if self.vad_open { p >= VAD_KEEP } else { p >= VAD_START && self.vad_prev >= VAD_KEEP };
+                self.vad_prev = p;
+                self.vad_open = on;
+                (on, Some(on))
+            } else {
+                self.vad_open = false;
+                (rms >= threshold, None)
+            };
             let current = frame.clone();
             // Голосовой порог с гистерезисом и предзаписью — общий для всех активаций «по голосу».
-            let voice_frames = match self.gate.process(frame, rms, threshold, None, silenced) {
+            let voice_frames = match self.gate.process(frame, rms, threshold, by_ai, silenced) {
                 dsp::GateOut::Send(frames) => frames,
                 _ => Vec::new(),
             };
@@ -902,6 +986,8 @@ impl Audio {
                 && (k == settings::ActKind::Voice || (k == settings::ActKind::Inherit && !settings::push_to_talk()))
         });
         // что кодируем: при голосе — кадры с предзаписью, иначе (только рация) — текущий кадр
+        // проверка звука: слышно всегда, без рации и порога (кадр уже прошёл шумодав и усиление)
+        let test_frame = settings::mic_test().then(|| current.clone());
         let mut timeline = if voice_used { voice_frames } else if any { vec![current] } else { Vec::new() };
         if !flush.is_empty() {
             flush.append(&mut timeline);
@@ -919,12 +1005,12 @@ impl Audio {
             // Проверка звука: слышите то же, что услышали бы другие, но на сервер ничего не уходит.
             // Без сервера (`Link::Offline`) голос только для проверки — и тоже никуда не уходит.
             self.end_all(&acts, outbox);
-            if any && settings::mic_test() {
+            if let Some(cur) = test_frame {
                 let mut qs = self.play.lock_ok();
                 let src = qs.by_source.entry(TEST_SOURCE).or_insert_with(|| SrcQueue::new(1.0));
-                for f in &timeline {
-                    src.q.extend(f.iter().copied());
-                }
+                src.local = true; // себя слышно с той же громкостью, что игроков рядом
+                // всегда текущий кадр: кадры активации с предзаписью повторили бы уже сыгранное
+                src.q.extend(cur.iter().copied());
                 if src.q.len() > MAX_QUEUE {
                     let n = src.q.len() - MAX_QUEUE;
                     src.q.drain(..n);
@@ -1053,7 +1139,7 @@ impl Audio {
         crate::notes::on_audio(&key, rms);
         // выбор взглядом: тот, на который смотрим, громко, остальные рядом — тихо фоном
         let gain = settings::music_volume_pct() as f32 / 100.0 * crate::notes::focus_gain(&key);
-        self.enqueue(source_id, decoded, gain, distance, Some(key), true);
+        self.enqueue(source_id, decoded, gain, distance, Some(key), true, false);
     }
 
     /// Декодировать Opus источника (с заполнением потерь). `None` — старый или повторный пакет.
@@ -1114,17 +1200,28 @@ impl Audio {
             gain *= settings::group_volume_pct() as f32 / 100.0; // ползунок «Группы» во вкладке «Громкость»
             settings::set_server_has_groups(true);
         }
-        self.enqueue(source_id, decoded, gain, distance, nick, positional);
+        self.enqueue(source_id, decoded, gain, distance, nick, positional, !group);
     }
 
     /// Положить звук источника в очередь воспроизведения. `key` — ник игрока или ключ звука мира (`@…`):
     /// по нему звук ставится в мир.
-    fn enqueue(&mut self, source_id: [u8; 16], decoded: Vec<f32>, gain: f32, distance: f32, key: Option<String>, positional: bool) {
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue(
+        &mut self,
+        source_id: [u8; 16],
+        decoded: Vec<f32>,
+        gain: f32,
+        distance: f32,
+        key: Option<String>,
+        positional: bool,
+        local: bool,
+    ) {
         let mut qs = self.play.lock_ok();
         let src = qs.by_source.entry(source_id).or_insert_with(|| SrcQueue::new(gain));
         src.gain = gain;
         src.max_dist = distance.max(0.0);
         src.positional = positional;
+        src.local = local;
         if src.nick != key {
             src.nick = key;
         }
@@ -1160,8 +1257,7 @@ fn run(
     log: &Logger,
 ) -> Result<(), String> {
     let addr = conn.addr();
-    let sock = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("bind: {e}"))?;
-    sock.connect(&addr).map_err(|e| format!("connect {addr}: {e}"))?;
+    let sock = connect_udp(&addr)?;
     sock.set_read_timeout(Some(Duration::from_millis(10))).map_err(|e| e.to_string())?;
     let proto = match conn {
         Link::Svc { .. } => "Simple Voice Chat",
@@ -1353,6 +1449,43 @@ mod tests {
 
     fn res_of(d: &[(usize, Res, settings::ActKind)], acts: &[plasmo::Activation], name: &str) -> Res {
         d.iter().find(|x| acts[x.0].name == name).map(|x| x.1).unwrap()
+    }
+
+    #[test]
+    fn local_slider_does_not_touch_groups_or_music() {
+        let mut near = SrcQueue::new(0.8);
+        near.local = true;
+        let group = SrcQueue::new(0.5); // «Группы» уже в gain, «Локальный» не действует
+        let music = SrcQueue::new(0.7);
+        assert_eq!(near.effective_gain(0.0), 0.0, "«Локальный» 0% глушит голоса рядом");
+        assert_eq!(group.effective_gain(0.0), 0.5, "…но не группы");
+        assert_eq!(music.effective_gain(0.0), 0.7, "…и не музыку");
+        assert_eq!(near.effective_gain(1.5), 0.8 * 1.5);
+    }
+
+    #[test]
+    fn udp_address_keeps_ipv6_apart_from_port() {
+        assert_eq!(host_port("5.83.140.202", 24454), "5.83.140.202:24454");
+        assert_eq!(host_port("2001:db8::1", 24454), "[2001:db8::1]:24454");
+        assert_eq!(host_port("[2001:db8::1]", 24454), "[2001:db8::1]:24454", "скобки не удваиваются");
+        assert_eq!(host_port("voice.example.org", 24454), "voice.example.org:24454");
+        let v4: SocketAddr = "5.83.140.202:24454".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::1]:24454".parse().unwrap();
+        assert!(local_bind_addr(&v4).is_ipv4());
+        assert!(local_bind_addr(&v6).is_ipv6());
+        assert_eq!(local_bind_addr(&v6).port(), 0);
+    }
+
+    #[test]
+    fn udp_socket_matches_server_address_family() {
+        let s = connect_udp("127.0.0.1:9").unwrap();
+        assert!(s.local_addr().unwrap().is_ipv4());
+        // IPv6 может быть выключен на машине с тестами: тогда проверять нечего
+        if UdpSocket::bind("[::1]:0").is_ok() {
+            let s = connect_udp(&host_port("::1", 9)).unwrap();
+            assert!(s.local_addr().unwrap().is_ipv6(), "к IPv6-серверу — IPv6-сокет");
+        }
+        assert!(connect_udp("not a host").is_err());
     }
 
     /// Поддельный сервер SVC на 127.0.0.1: проверяем, что клиент проходит рукопожатие (Authenticate ->

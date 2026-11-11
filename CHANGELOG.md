@@ -22,6 +22,11 @@
 - Ноты и блик прячутся за мобами и игроками (и за вами в F5); эффекты — только у трёх ближайших проигрывателей в кадре, за спиной ничего не считается.
 - Проверка микрофона без сервера; поиск групп по названию и нику; значки и головы участников во вкладке «Группы».
 - Секрет на логотипе.
+- Исправлено по ревью #548: при выходе с сервера микрофон и голос останавливаются сразу (раньше голос мог уходить на старый сервер из главного меню).
+- Исправлено: сервер не может заставить клиент выделить гигабайты памяти огромным диапазоном дистанций.
+- Исправлено: голос работает с серверами по IPv6.
+- Исправлено: «Локальный» на 0% больше не глушит группы и пластинки; на вкладке устройств этот ползунок теперь называется «Громкость голосов рядом».
+- Исправлено: если держать ползунок игрока и крутить список, громкость не переходит на другого игрока.
 
 **English**
 
@@ -43,3 +48,8 @@
 - Notes and the shine hide behind mobs and players (and behind you in F5); effects only for the three nearest jukeboxes in view, nothing is computed behind you.
 - Microphone test without a server; group search by name and member; icons and member heads in the Groups tab.
 - A secret on the logo.
+- Fixed (review of #548): leaving a server stops the microphone and voice at once (before, voice could still reach the old server from the main menu).
+- Fixed: a server can no longer make the client allocate gigabytes with a huge distance range.
+- Fixed: voice works with IPv6 servers.
+- Fixed: *Local* at 0% no longer mutes groups and discs; on the devices tab this slider is now called *Nearby voices volume*.
+- Fixed: holding a player's slider while scrolling the list no longer moves the drag to another player.

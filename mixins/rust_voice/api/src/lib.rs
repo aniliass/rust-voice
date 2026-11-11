@@ -11,6 +11,7 @@ mod menu;
 mod nametag;
 mod notes;
 mod plasmo;
+mod rnnoise;
 mod roster;
 mod settings;
 mod spatial;
@@ -19,7 +20,7 @@ mod voice;
 
 use horizon_client::extras::Corner;
 use horizon_client::mod_api::{
-    ClientChatReceivedEvent, ClientPacketEvent, ClientboundPlayPacket, CommandEvent, Flow, Hooks, Host, HudEvent, KeyEvent, ModsEvent,
+    ClientChatReceivedEvent, ClientDisconnectingEvent, ClientPacketEvent, GuiLayerPreEvent, ClientboundPlayPacket, CommandEvent, Flow, Hooks, Host, HudEvent, KeyEvent, ModsEvent,
     MouseScrollingEvent, NativeMod, RenderNameTagEvent, ScreenCharTypedPreEvent, ScreenMouseButtonPressedPreEvent, ScreenMouseButtonReleasedPreEvent, ScreenMouseScrolledPreEvent, ScreenRenderPostEvent,
     ServerboundPlayPacket, TickEvent,
 };
@@ -154,6 +155,21 @@ impl State {
     /// ни наш PlayerInfo, а старая UDP-сессия на нём мертва, поэтому начинаем с нуля.
     fn reset_session(&mut self, why: &str) {
         self.log(&format!("новая сессия на сервере ({why}): сбрасываю голос и начинаю хендшейк заново"));
+        self.clear_session();
+    }
+
+    /// Выход с сервера (в главное меню, кик, обрыв): микрофон и UDP-сессию закрываем сразу. Иначе рабочий
+    /// поток жил бы дальше и из главного меню отправлял бы речь (активация голосом) на прошлый сервер.
+    fn leave_server(&mut self, why: &str) {
+        if self.voice.is_some() && !self.offline_voice {
+            self.log(&format!("отключение от сервера ({why}): останавливаю микрофон и голос"));
+        }
+        self.clear_session();
+        self.offline_voice = false;
+    }
+
+    /// Забыть всё о прошлом сервере: голос (Drop останавливает микрофон, вывод и UDP), хендшейк, игроков, группы.
+    fn clear_session(&mut self) {
         self.restart_handshake();
         self.sent = false; // tick заново отправит minecraft:register, как только появится play-состояние
         self.attempts = 0;
@@ -486,6 +502,10 @@ impl Hooks for Mod {
         }
     }
 
+    fn client_disconnecting(&self, _host: &dyn Host, _event: &mut ClientDisconnectingEvent) {
+        self.state.lock_ok().leave_server("client_disconnecting");
+    }
+
     fn tick(&self, host: &mut dyn Host, _event: &mut TickEvent) {
         settings::set_menu_key_label(&settings::ptt_label_for(&menu_key(&*host)));
         for slot in 0..settings::PTT_SLOTS {
@@ -506,6 +526,11 @@ impl Hooks for Mod {
             settings::set_mic_test(false);
         }
         let mut st = self.state.lock_ok();
+        // Подстраховка к client_disconnecting: соединения с игровым сервером уже нет, а голосовая сессия
+        // осталась — закрываем её, чтобы микрофон не работал из главного меню.
+        if st.voice.is_some() && !st.offline_voice && host.client_state().is_some_and(|s| s.server_address.is_none()) {
+            st.leave_server("tick: no server connection");
+        }
         // Без голосового сервера (одиночный мир, сервер без плагина) список устройств читаем сами, в фоне:
         // микрофон и наушники можно выбрать заранее, и они понадобятся на первом же сервере с голосом.
         // «Проверка звука» без голосового сервера: своя сессия без сети — микрофон, шумодав и наушники те же,
@@ -709,6 +734,12 @@ impl Hooks for Mod {
                 return;
             }
             ClientboundPlayPacket::CustomPayload(_) => {}
+            // строка над хотбаром (pv-addon-discs шлёт «Загружаем...» именно так, не через чат)
+            ClientboundPlayPacket::SetActionBarText(p) => {
+                use horizon_client::scoreboard::{comp_text, tag_to_json};
+                notes::on_server_actionbar(&groups::plain(&comp_text(&tag_to_json(&p.text))));
+                return;
+            }
             _ => return,
         }
         let ClientboundPlayPacket::CustomPayload(p) = &event.packet else { return };
@@ -888,6 +919,8 @@ impl Hooks for Mod {
         {
             let mut gui = Gui { host: &*host, batch: &mut *event.batch };
             menu::draw_notice(&mut gui, gui_w, gui_h);
+            menu::draw_disc_toast(&mut gui, gui_w, gui_h);
+            menu::draw_pin_toast(&mut gui, gui_w, gui_h);
         }
         // Кто сейчас говорит: голова, ник и динамик в углу экрана.
         {
@@ -968,7 +1001,23 @@ impl Hooks for Mod {
             }
             return Flow::Cancel;
         }
+        // строки пластинок над хотбаром («Загружаем...», «Сейчас играет: …») — своей плашкой
+        if event.overlay {
+            let text = groups::plain(event.message);
+            notes::on_server_actionbar(&text);
+            if notes::hide_vanilla_bar() {
+                return Flow::Cancel;
+            }
+        }
         if event.system && !event.overlay && groups::on_chat(event.message, menu::is_live()) {
+            return Flow::Cancel;
+        }
+        Flow::Continue
+    }
+
+    /// Ванильная строка над хотбаром, пока там строка пластинок: её заменяет наша плашка.
+    fn gui_layer_pre(&self, _host: &mut dyn Host, event: &mut GuiLayerPreEvent<'_>) -> Flow {
+        if event.layer.ends_with("overlay_message") && notes::hide_vanilla_bar() {
             return Flow::Cancel;
         }
         Flow::Continue

@@ -48,17 +48,32 @@ const FADE_DIST: f64 = 24.0;
 /// Как часто проверять, не за стеной ли источник.
 const LOS_EVERY: Duration = Duration::from_millis(150);
 
-/// Замочек 7×8 у закреплённой пластинки.
-const LOCK: [&str; 8] = [
-    "..###..",
-    ".#...#.",
-    ".#...#.",
-    "#######",
-    "###.###",
-    "###.###",
-    "#######",
-    ".......",
-];
+/// Замочек 7×7 (общий для таблички и плашки закрепления): прямоугольники (x, y, w, h, прорезь ли).
+/// `lift` 0..2 — насколько поднята дужка; поднятая отходит правой ножкой (замок открыт).
+pub fn lock_rects(lift: i32) -> Vec<(i32, i32, i32, i32, bool)> {
+    let mut v = vec![(2, -lift, 3, 1, false), (1, 1 - lift, 1, 2, false)];
+    if lift == 0 {
+        v.push((5, 1, 1, 2, false));
+    }
+    v.push((0, 3, 7, 4, false));
+    v.push((3, 4, 1, 2, true));
+    v
+}
+
+/// Насколько поднята дужка замка на табличке: при закреплении она за 0.22 с защёлкивается.
+fn lock_lift(st: &State) -> i32 {
+    match st.pinned.as_ref() {
+        Some((_, _)) => {
+            let age = PIN_TOAST
+                .lock()
+                .ok()
+                .and_then(|t| t.as_ref().filter(|(on, _, _)| *on).map(|(_, _, at)| at.elapsed().as_secs_f32()))
+                .unwrap_or(1.0);
+            ((1.0 - (age / 0.22).min(1.0)) * 2.0).round() as i32
+        }
+        None => 0,
+    }
+}
 
 /// Нота 8×8: головка внизу слева, флажок вправо.
 const GLYPH: [&str; 8] = [
@@ -295,17 +310,27 @@ pub fn draw(host: &dyn Host, batch: &mut horizon_client::hud::HudBatch, gui_w: f
     if glow {
         draw_glow(host, batch, &cam, &active, &occ, gui_w, gui_h);
     }
-    if !crate::settings::notes_on() {
+    // ноты и табличка включаются отдельно: без нот табличка всё равно рисуется
+    let notes_on = crate::settings::notes_on();
+    if !notes_on && !crate::settings::disc_label_on() {
         return;
     }
     let positions: Vec<(String, [f64; 3])> = active.iter().map(|(k, p, _)| (k.clone(), *p)).collect();
     let block_of = |key: &str| active.iter().find(|(k, _, _)| k == key).and_then(|(_, _, b)| *b);
     // (точка, прозрачность, цвет, размер): размер > 0 — нота, < 0 — осколок (его сторона в GUI-пикселях)
     let mut draws: Vec<([f64; 3], f32, u32, f32)> = Vec::new();
-    let mut labels: Vec<([f64; 3], String, f32, bool)> = Vec::new();
+    let mut labels: Vec<([f64; 3], String, f32, Option<i32>)> = Vec::new();
     with(|st| {
         st.srcs.retain(|_, s| now.duration_since(s.last_audio) < Duration::from_secs(10));
-        for (key, pos) in &positions {
+        if !notes_on {
+            // ноты выключены: не копим и не рисуем (дальше в полёте ничего нет)
+            st.notes.clear();
+            st.shards.clear();
+            for s in st.srcs.values_mut() {
+                s.pending = 0;
+            }
+        }
+        for (key, pos) in positions.iter().filter(|_| notes_on) {
             let Some(src) = st.srcs.get_mut(key) else { continue };
             if now.duration_since(src.last_audio) > PLAYING_FOR {
                 src.pending = 0;
@@ -404,7 +429,7 @@ pub fn draw(host: &dyn Host, batch: &mut horizon_client::hud::HudBatch, gui_w: f
                 let top = source_top(*pos, block_of(key));
                 let anchor = [top[0], top[1] + LABEL_UP, top[2]];
                 if host.client_visual_clear(cam.pos, anchor) {
-                    labels.push((anchor, title.clone(), src.fast, is_pinned(st, key)));
+                    labels.push((anchor, title.clone(), src.fast, is_pinned(st, key).then(|| lock_lift(st))));
                 }
             }
         }
@@ -497,7 +522,8 @@ fn nearest_playing(host: &dyn Host, camera: &crate::nametag::Cam, now: Instant) 
             });
             if far || now.duration_since(heard) > PIN_SILENCE {
                 st.pinned = None;
-                crate::settings::notice("Пластинка откреплена");
+                let title = st.titles.get(&k).cloned();
+                set_pin_toast(false, title);
             } else {
                 st.pinned = Some((k, heard));
             }
@@ -639,28 +665,110 @@ const PIN_SILENCE: Duration = Duration::from_secs(3);
 /// никуда не смотрим — снять закрепление.
 pub fn toggle_pin() {
     let now = Instant::now();
-    let msg = with(|st| {
+    // (закрепили ли, название) или None — никуда не смотрим и нечего снимать
+    let done = with(|st| {
         let look = st.look.as_ref().filter(|(_, at)| now.duration_since(*at) < FOCUS_FRESH).map(|(k, _)| k.clone());
-        match (look, st.pinned.as_ref().map(|(k, _)| k.clone())) {
+        let pinned = st.pinned.as_ref().map(|(k, _)| k.clone());
+        match (look, pinned) {
             (Some(l), Some(p)) if l == p => {
                 st.pinned = None;
-                "Пластинка откреплена"
+                Some((false, st.titles.get(&p).cloned()))
             }
             (Some(l), _) => {
+                let t = st.titles.get(&l).cloned();
                 st.pinned = Some((l, now));
-                "Пластинка закреплена"
+                Some((true, t))
             }
-            (None, Some(_)) => {
+            (None, Some(p)) => {
                 st.pinned = None;
-                "Пластинка откреплена"
+                Some((false, st.titles.get(&p).cloned()))
             }
-            (None, None) => "Посмотрите на играющий проигрыватель",
+            (None, None) => None,
         }
-    });
-    if let Some(m) = msg {
-        crate::settings::notice(m);
+    })
+    .flatten();
+    match done {
+        Some((on, title)) => set_pin_toast(on, title),
+        None => crate::settings::notice("Посмотрите на играющий проигрыватель"),
     }
 }
+
+/// Плашка «закреплено / откреплено» над хотбаром: (закреплено ли, название трека, когда).
+static PIN_TOAST: Mutex<Option<(bool, Option<String>, Instant)>> = Mutex::new(None);
+
+fn set_pin_toast(on: bool, title: Option<String>) {
+    if let Ok(mut t) = PIN_TOAST.lock() {
+        *t = Some((on, title, Instant::now()));
+    }
+}
+
+/// Для отрисовки: (закреплено ли, название, сколько секунд прошло), пока плашка не погасла.
+pub fn pin_toast() -> Option<(bool, Option<String>, f32)> {
+    let t = PIN_TOAST.lock().ok()?;
+    let (on, title, at) = t.as_ref()?;
+    let age = at.elapsed().as_secs_f32();
+    (age < PIN_TOAST_FOR).then(|| (*on, title.clone(), age))
+}
+
+/// Что пишет pv-addon-discs над хотбаром — показываем своей плашкой вместо жёлтой строки игры.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DiscNote {
+    Loading,
+    Playing(String),
+    NotFound(String),
+}
+
+static DISC_TOAST: Mutex<Option<(DiscNote, Instant)>> = Mutex::new(None);
+
+/// Строка над хотбаром от сервера: если это пластинки (pv-addon-discs, русский или английский) — запоминаем
+/// для своей плашки и говорим «спрятать оригинал».
+pub fn on_actionbar(plain: &str) -> bool {
+    let t = plain.trim();
+    let note = if t == "Загружаем..." || t == "Loading..." {
+        DiscNote::Loading
+    } else if let Some(x) = t.strip_prefix("Сейчас играет: ").or_else(|| t.strip_prefix("Now playing: ")) {
+        DiscNote::Playing(x.trim().to_string())
+    } else if let Some(x) = t.strip_prefix("Трек не найден: ").or_else(|| t.strip_prefix("Track not found: ")) {
+        DiscNote::NotFound(x.trim().to_string())
+    } else {
+        return false;
+    };
+    if let Ok(mut d) = DISC_TOAST.lock() {
+        *d = Some((note, Instant::now()));
+    }
+    true
+}
+
+/// Плашка пластинки: (что, сколько секунд прошло), пока не погасла. «Загружаем» гаснет и раньше — как только
+/// пластинка заиграла (сервер следом пришлёт «Сейчас играет»).
+pub fn disc_toast() -> Option<(DiscNote, f32)> {
+    let d = DISC_TOAST.lock().ok()?;
+    let (n, at) = d.as_ref()?;
+    let age = at.elapsed().as_secs_f32();
+    (age < DISC_TOAST_FOR).then(|| (n.clone(), age))
+}
+
+pub const DISC_TOAST_FOR: f32 = 3.0;
+
+/// Когда пришла последняя строка пластинок над хотбаром (пока её не сменила чужая строка).
+static HIDE_BAR: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Строка над хотбаром из пакета сервера: пластинки — своей плашкой (а ванильную строку прячем),
+/// любая другая — показывается как обычно.
+pub fn on_server_actionbar(plain: &str) {
+    let disc = on_actionbar(plain);
+    if let Ok(mut h) = HIDE_BAR.lock() {
+        *h = disc.then(Instant::now);
+    }
+}
+
+/// Прятать ли сейчас ванильную строку над хотбаром (она держится ~3 с и ещё гаснет).
+pub fn hide_vanilla_bar() -> bool {
+    HIDE_BAR.lock().ok().and_then(|h| *h).is_some_and(|at| at.elapsed().as_secs_f32() < 5.0)
+}
+
+/// Сколько секунд видна плашка закрепления.
+pub const PIN_TOAST_FOR: f32 = 2.2;
 
 /// Закреплён ли этот проигрыватель (для замочка на табличке).
 fn is_pinned(st: &State, key: &str) -> bool {
@@ -755,9 +863,10 @@ fn draw_glow(
         let corner = glow_corner(cycle_f.floor() as u32);
         let (flip_x, flip_y) = (corner & 1 == 1, corner & 2 == 2);
         let center = -GLOW_WIDTH + t * (1.0 + 2.0 * GLOW_WIDTH);
-        // строки по 1 GUI-пикселю: в каждой — отрезок оболочки и в нём полоса (мягкие края: 4 ступени)
-        let step = 1.0f32;
-        let mut y = y0.max(0.0).floor();
+        // строки: в каждой — отрезок оболочки и в нём полоса (мягкие края: 4 ступени)
+        // строки по полпикселя GUI: на краях полосы и блока не видно «лесенки»
+        let step = 0.5f32;
+        let mut y = (y0.max(0.0) / step).floor() * step;
         while y < y1.min(gui_h) {
             let yc = y + step * 0.5;
             if let Some((l, r)) = hull_span(&hull, yc) {
@@ -966,13 +1075,13 @@ fn short_title(t: &str) -> String {
 /// сдвигом и масштабом, поэтому уменьшается целиком, вместе с текстом.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
-fn draw_label(host: &dyn Host, batch: &mut horizon_client::hud::HudBatch, x: f32, y: f32, scale: f32, title: &str, level: f32, secs: f32, fade: f32, pinned: bool) {
+fn draw_label(host: &dyn Host, batch: &mut horizon_client::hud::HudBatch, x: f32, y: f32, scale: f32, title: &str, level: f32, secs: f32, fade: f32, pinned: Option<i32>) {
     use horizon_client::hud_layout::{GuiDraw, PoseOp};
     let title = short_title(title);
     let tw = crate::menu::text_width(&title);
     let (pad, disc, gap, bars) = (4, 9, 4, 11);
     // закреплённый: справа золотой замочек 7×8
-    let lock_w = if pinned { 7 + gap } else { 0 };
+    let lock_w = if pinned.is_some() { 7 + gap } else { 0 };
     let w = pad + disc + gap + tw + gap + bars + lock_w + pad;
     let h = 15;
     let a = |argb: u32| with_alpha(argb, fade);
@@ -1007,14 +1116,11 @@ fn draw_label(host: &dyn Host, batch: &mut horizon_client::hud::HudBatch, x: f32
         let bh = (1.0 + level * 60.0 * wob).clamp(1.0, 9.0).round() as i32;
         rect(bx + i * 3, 12 - bh, 2, bh, 0xFFA8_55F7);
     }
-    if pinned {
+    if let Some(lift) = pinned {
+        // тот же замочек, что на плашке «Закреплено»: золотой, с тёмной прорезью, дужка защёлкивается
         let lx = bx + bars + gap;
-        for (row, line) in LOCK.iter().enumerate() {
-            for (col, ch) in line.bytes().enumerate() {
-                if ch == b'#' {
-                    rect(lx + col as i32, 3 + row as i32, 1, 1, 0xFFFF_D25A);
-                }
-            }
+        for (rx, ry, rw, rh, slot) in lock_rects(lift) {
+            rect(lx + rx, 4 + ry, rw, rh, if slot { 0xFF14_0A20 } else { 0xFFFF_D25A });
         }
     }
     // название
@@ -1032,7 +1138,7 @@ fn label_scale(dist: f64) -> f32 {
 const LABEL_NEAR: f64 = 3.0;
 
 /// Пластинка 9×9 для таблички.
-const DISC: [&str; 9] = [
+pub(crate) const DISC: [&str; 9] = [
     "..#####..",
     ".#==#==#.",
     "#=#####=#",
@@ -1223,6 +1329,17 @@ mod tests {
         let fwd = [fwd[0] / l, fwd[1] / l, fwd[2] / l];
         assert!(ray_box_t(cam, fwd, [0.0, 64.0, 0.0], [1.0, 65.0, 1.0]).is_some(), "смотрим на него");
         assert!(ray_box_t(cam, fwd, [2.0, 64.0, 0.0], [3.0, 65.0, 1.0]).is_none(), "соседний справа — мимо");
+    }
+
+
+    #[test]
+    fn disc_actionbar_is_recognised() {
+        assert!(on_actionbar("Загружаем..."));
+        assert_eq!(disc_toast().map(|t| t.0), Some(DiscNote::Loading));
+        assert!(on_actionbar("Сейчас играет: SIAMÉS \"The Wolf\""));
+        assert_eq!(disc_toast().map(|t| t.0), Some(DiscNote::Playing("SIAMÉS \"The Wolf\"".into())));
+        assert!(on_actionbar("Track not found: abc"));
+        assert!(!on_actionbar("Вы получили достижение"));
     }
 
 }

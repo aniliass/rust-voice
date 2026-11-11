@@ -299,12 +299,51 @@ pub struct Activation {
     pub weight: i32,
 }
 
+/// Дистанции, из которых можно выбрать. `[-1, max]` хранится диапазоном, а не списком: `max` присылает
+/// сервер, и при `max = 2^31 - 1` список занял бы ~8 ГБ памяти.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DistanceChoices {
+    /// Любая от 1 до `max` включительно (`max` >= 1).
+    Range(i32),
+    /// Ровно эти значения (только положительные).
+    List(Vec<i32>),
+}
+
+impl DistanceChoices {
+    pub fn len(&self) -> usize {
+        match self {
+            DistanceChoices::Range(max) => *max as usize,
+            DistanceChoices::List(l) => l.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Дистанция под номером `i` (с нуля).
+    pub fn get(&self, i: usize) -> Option<i32> {
+        match self {
+            DistanceChoices::Range(max) => (i < *max as usize).then(|| i as i32 + 1),
+            DistanceChoices::List(l) => l.get(i).copied(),
+        }
+    }
+
+    /// Номер дистанции `d` среди вариантов.
+    pub fn position(&self, d: i32) -> Option<usize> {
+        match self {
+            DistanceChoices::Range(max) => (1..=*max).contains(&d).then(|| d as usize - 1),
+            DistanceChoices::List(l) => l.iter().position(|x| *x == d),
+        }
+    }
+}
+
 impl Activation {
     /// Дистанции для ползунка в меню (пусто — ползунка нет).
-    pub fn distance_choices(&self) -> Vec<i32> {
+    pub fn distance_choices(&self) -> DistanceChoices {
         match self.distances.as_slice() {
-            [-1, max] if *max >= 1 => (1..=*max).collect(),
-            list => list.iter().copied().filter(|d| *d > 0).collect(),
+            [-1, max] if *max >= 1 => DistanceChoices::Range(*max),
+            list => DistanceChoices::List(list.iter().copied().filter(|d| *d > 0).collect()),
         }
     }
 
@@ -776,7 +815,7 @@ mod tests {
         assert_eq!(prox.id, activation_id("proximity"));
         assert_eq!(prox.distances, [8, 16, 32]);
         assert_eq!((prox.default_distance, prox.proximity, prox.transitive, prox.weight), (16, true, false, 1));
-        assert_eq!(prox.distance_choices(), [8, 16, 32]);
+        assert_eq!(prox.distance_choices(), DistanceChoices::List(vec![8, 16, 32]));
         assert_eq!(prox.allowed_distance(32), 32);
         assert_eq!(prox.allowed_distance(20), 16, "чего нет в списке — по умолчанию");
         // ActivationRegister — та же запись отдельно
@@ -792,6 +831,11 @@ mod tests {
         body.extend_from_slice(&5i32.to_be_bytes());
         let g = parse_activation_register(&body).unwrap();
         assert_eq!(g.distance_choices().len(), 64, "[-1, 64] — любая от 1 до 64");
+        assert_eq!(g.distance_choices().get(0), Some(1));
+        assert_eq!(g.distance_choices().get(63), Some(64));
+        assert_eq!(g.distance_choices().get(64), None);
+        assert_eq!(g.distance_choices().position(40), Some(39));
+        assert_eq!(g.distance_choices().position(65), None);
         assert_eq!(g.allowed_distance(40), 40);
         assert_eq!(g.allowed_distance(0), 0);
         assert!(g.transitive && !g.proximity);
@@ -871,6 +915,33 @@ mod tests {
         assert_eq!(&p[5..21], s);
         assert_eq!(p.len(), 37);
         assert_eq!(i64::from_be_bytes(p[21..29].try_into().unwrap()), 1_700_000_000_000);
+    }
+
+    #[test]
+    fn huge_server_distance_range_is_not_allocated() {
+        // сервер прислал [-1, 2^31 - 1]: список занял бы ~8 ГБ, диапазон — ничего
+        let a = Activation {
+            name: "proximity".into(),
+            translation: String::new(),
+            id: activation_id("proximity"),
+            distances: vec![-1, i32::MAX],
+            default_distance: 16,
+            proximity: true,
+            transitive: false,
+            stereo: false,
+            weight: 0,
+        };
+        let c = a.distance_choices();
+        assert_eq!(c, DistanceChoices::Range(i32::MAX));
+        assert_eq!(c.len(), i32::MAX as usize);
+        assert_eq!(c.get(c.len() - 1), Some(i32::MAX));
+        assert_eq!(c.get(c.len()), None);
+        assert_eq!(c.position(i32::MAX), Some(c.len() - 1));
+        assert_eq!(c.position(0), None);
+        assert_eq!(c.position(-5), None);
+        // [-1, 0] и прочие пустые варианты — ползунка нет
+        let none = Activation { distances: vec![-1, 0], ..a.clone() };
+        assert!(none.distance_choices().is_empty());
     }
 
     #[test]

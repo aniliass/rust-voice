@@ -19,6 +19,8 @@ static GROUP_VOLUME: AtomicU32 = AtomicU32::new(100);
 static MUSIC_VOLUME: AtomicU32 = AtomicU32::new(100);
 /// Шумоподавление микрофона, проценты 0..=100 (0 — выключено).
 static NOISE_PCT: AtomicU32 = AtomicU32::new(0);
+/// Шумодав нейросетью (RNNoise), иначе своё спектральное.
+static NOISE_AI: AtomicBool = AtomicBool::new(true);
 /// Значок статуса перед ником игрока над головой (говорит, замьючен, без мода).
 static NAMETAGS_ON: AtomicBool = AtomicBool::new(true);
 /// Ноты над пластинкой (звуки мира), см. `notes.rs`.
@@ -90,6 +92,10 @@ static PLAYERS_SCROLL: AtomicU32 = AtomicU32::new(0);
 
 // ---------- что происходит сейчас (пишет голосовой поток) ----------
 static LEVEL: AtomicU32 = AtomicU32::new(0); // f32: громкость микрофона (RMS) после усиления
+/// Активация по голосу нейросетью (RNNoise решает, речь ли это), иначе по порогу в дБ.
+static VAD_AI: AtomicBool = AtomicBool::new(false);
+/// Вероятность речи в последнем кадре по нейросети (0..1, как биты f32) — для полосы в меню.
+static SPEECH: AtomicU32 = AtomicU32::new(0);
 static SPEAKING: AtomicBool = AtomicBool::new(false);
 static HEARING: AtomicU32 = AtomicU32::new(0);
 static CONNECTED: AtomicBool = AtomicBool::new(false);
@@ -202,12 +208,14 @@ pub fn step_proximity_distance(up: bool) -> Option<i32> {
         return None;
     }
     let cur = act_distance(&a);
-    let i = choices.iter().position(|d| *d == cur).unwrap_or(0);
-    let j = if up { (i + 1) % choices.len() } else { (i + choices.len() - 1) % choices.len() };
+    let n = choices.len();
+    let i = choices.position(cur).unwrap_or(0);
+    let j = if up { (i + 1) % n } else { (i + n - 1) % n };
+    let d = choices.get(j)?;
     let mut p = act_pref(PROXIMITY);
-    p.distance = Some(choices[j]);
+    p.distance = Some(d);
     set_act_pref(PROXIMITY, p);
-    Some(choices[j])
+    Some(d)
 }
 
 /// Говорящие в группе — отдельным списком слева, остальные справа (иначе один общий список).
@@ -234,17 +242,16 @@ pub fn notice(text: &str) {
         *n = Some((text.to_string(), Instant::now()));
     }
 }
-/// Подсказка, если ещё не погасла: (текст, видимость 0..=1).
+/// Подсказка, если ещё не погасла: (текст, сколько секунд прошло).
 pub fn current_notice() -> Option<(String, f32)> {
-    const FOR: Duration = Duration::from_millis(1800);
     let n = NOTICE.lock().ok()?;
     let (text, at) = n.as_ref()?;
-    let age = at.elapsed();
-    if age >= FOR {
-        return None;
-    }
-    Some((text.clone(), ((FOR - age).as_secs_f32() / FOR.as_secs_f32() * 3.0).min(1.0)))
+    let age = at.elapsed().as_secs_f32();
+    (age < NOTICE_FOR).then(|| (text.clone(), age))
 }
+
+/// Сколько секунд видна подсказка над хотбаром.
+pub const NOTICE_FOR: f32 = 1.8;
 
 /// Клавиша, назначенная в меню мода для слота рации (None — не назначали, берём из Options > Mods).
 pub fn slot_binding(slot: usize) -> Option<String> {
@@ -395,6 +402,8 @@ pub fn set_mic_off(v: bool) {
         MIC_GEN.fetch_add(1, Relaxed); // голосовой поток закроет или откроет запись
     }
 }
+pub fn noise_ai() -> bool { NOISE_AI.load(Relaxed) }
+pub fn set_noise_ai(v: bool) { NOISE_AI.store(v, Relaxed) }
 pub fn hum_filter() -> bool { HUM_FILTER.load(Relaxed) }
 pub fn set_hum_filter(v: bool) { HUM_FILTER.store(v, Relaxed) }
 pub fn agc_on() -> bool { AGC_ON.load(Relaxed) }
@@ -581,6 +590,10 @@ pub fn placing_group() -> bool { PLACING_GROUP.load(Relaxed) }
 pub fn set_placing_group(v: bool) { PLACING_GROUP.store(v, Relaxed) }
 
 pub fn level() -> f32 { f32::from_bits(LEVEL.load(Relaxed)) }
+pub fn vad_ai() -> bool { VAD_AI.load(Relaxed) }
+pub fn set_vad_ai(v: bool) { VAD_AI.store(v, Relaxed) }
+pub fn speech() -> f32 { f32::from_bits(SPEECH.load(Relaxed)) }
+pub fn set_speech(v: f32) { SPEECH.store(v.to_bits(), Relaxed) }
 pub fn set_level(v: f32) { LEVEL.store(v.to_bits(), Relaxed) }
 pub fn speaking() -> bool { SPEAKING.load(Relaxed) }
 pub fn set_speaking(v: bool) { SPEAKING.store(v, Relaxed) }
@@ -891,6 +904,8 @@ pub fn save() {
     text.push_str(&format!("music_volume={}\n", music_volume_pct()));
     text.push_str(&format!("notes={}\n", notes_on()));
     text.push_str(&format!("hotbar_icon={}\n", hotbar_icon_on()));
+    text.push_str(&format!("noise_ai={}\n", noise_ai()));
+    text.push_str(&format!("vad_ai={}\n", vad_ai()));
     text.push_str(&format!("disc_label={}\n", disc_label_on()));
     text.push_str(&format!("disc_glow={}\n", disc_glow_on()));
     text.push_str(&format!("disc_focus={}\n", disc_focus_on()));
@@ -984,8 +999,11 @@ pub fn load() {
                     }
                 }
                 "mic_device" => set_mic_device(v),
-                "mic_off" => set_mic_off(v == "true"),
+                // «Отключить устройство» убрано из меню: старое значение не включаем, иначе микрофон не вернуть
+                "mic_off" => set_mic_off(false),
                 "hum_filter" => set_hum_filter(v != "false"),
+                "noise_ai" => set_noise_ai(v != "false"),
+                "vad_ai" => set_vad_ai(v == "true"),
                 "agc" => set_agc_on(v == "true"),
                 "occlusion" => set_occlusion_on(v != "false"),
                 "directional" => set_directional_on(v != "false"),

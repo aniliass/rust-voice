@@ -360,7 +360,9 @@ fn from_rel_len(rel: [f64; 3], dist: f32, occ: f32, max_dist: f32) -> Params {
     let fade = crate::settings::dist_fade_on();
     let gain = if fade { dsp::distance_gain(dist, max_dist) } else { 1.0 };
     let far = if fade && max_dist > 0.0 { (dist / max_dist).clamp(0.0, 1.0) } else { 0.0 };
-    Params { gain, side: side * near, front: lerp1(front, near), occ, far }
+    let len = (rel[0] * rel[0] + rel[1] * rel[1] + rel[2] * rel[2]).sqrt();
+    let up = if len > 0.3 { (rel[1] / len) as f32 } else { 0.0 };
+    Params { gain, side: side * near, front: lerp1(front, near), occ, far, up }
 }
 
 fn lerp1(front: f32, t: f32) -> f32 {
