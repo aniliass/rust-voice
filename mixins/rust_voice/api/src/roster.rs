@@ -45,8 +45,8 @@ struct Roster {
     players: HashMap<String, VoicePlayer>,
     /// Пришёл ли полный список: пока нет, «без мода» не показываем, чтобы не ошибиться.
     listed: bool,
-    /// Источник голоса (UUID) -> ник игрока и голос ли это группы (линия Plasmo `groups`).
-    sources: HashMap<u128, (String, bool)>,
+    /// Источник Plasmo (UUID) -> чей он и где звучит.
+    sources: HashMap<u128, Src>,
     asked: HashMap<u128, Instant>,
     talking: HashMap<String, Instant>,
     /// Когда игрок последний раз говорил в группе (голос пришёл по линии группы).
@@ -123,7 +123,7 @@ pub fn on_player_disconnect(body: &[u8]) -> bool {
             ro.players.remove(k);
             ro.talking.remove(k);
         }
-        ro.sources.retain(|_, (nick, _)| !gone.contains(&key(nick)));
+        ro.sources.retain(|_, s| !matches!(s, Src::Player { nick, .. } if gone.contains(&key(nick))));
     });
     true
 }
@@ -176,27 +176,63 @@ pub fn on_svc_remove(uuid: [u8; 16]) {
     });
 }
 
-/// SourceInfoPacket: запоминаем, какому игроку принадлежит источник голоса.
+/// Источник звука Plasmo: голос игрока или звук мира (пластинка, моб, объявление сервера).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Src {
+    /// Голос игрока; `group` — по линии групп.
+    Player { nick: String, group: bool },
+    /// Звук из точки мира (например, пластинка в проигрывателе, pv-addon-discs).
+    Static { pos: [f64; 3], name: Option<String> },
+    /// Звук от сущности (по её id в мире).
+    Entity { id: u32, name: Option<String> },
+    /// Звук «прямо в уши», без места в мире; `sender` — кто прислал, если сервер сказал.
+    Direct { sender: Option<String> },
+}
+
+/// SourceInfoPacket: запоминаем, чей это источник и где он звучит.
 pub fn on_source_info(body: &[u8]) -> bool {
-    parse_source_info(body).is_some_and(|(src, p, group)| {
+    parse_source_info(body).is_some_and(|(src, kind, player)| {
         with(|ro| {
-            ro.sources.insert(src, (p.nick.clone(), group));
-            ro.players.entry(key(&p.nick)).or_insert(p);
+            ro.sources.insert(src, kind);
+            if let Some(p) = player {
+                ro.players.entry(key(&p.nick)).or_insert(p);
+            }
         });
         true
     })
 }
 
-fn parse_source_info(body: &[u8]) -> Option<(u128, VoicePlayer, bool)> {
+/// Строка для лога о звуке мира из SourceInfo (`None` — это голос игрока).
+pub fn world_source_note(body: &[u8]) -> Option<String> {
+    match parse_source_info(body)?.1 {
+        Src::Player { .. } => None,
+        Src::Static { pos, name } => Some(format!(
+            "звук мира в точке {:.0} {:.0} {:.0}{}",
+            pos[0],
+            pos[1],
+            pos[2],
+            name.map(|n| format!(" («{n}»)")).unwrap_or_default()
+        )),
+        Src::Entity { id, name } => Some(format!("звук сущности #{id}{}", name.map(|n| format!(" («{n}»)")).unwrap_or_default())),
+        Src::Direct { sender } => Some(format!("прямой звук{}", sender.map(|n| format!(" от {n}")).unwrap_or_default())),
+    }
+}
+
+/// Что известно об источнике (если сервер уже прислал SourceInfo).
+pub fn source(src: [u8; 16]) -> Option<Src> {
+    let id = u128::from_be_bytes(src);
+    with(|ro| ro.sources.get(&id).cloned()).flatten()
+}
+
+fn parse_source_info(body: &[u8]) -> Option<(u128, Src, Option<VoicePlayer>)> {
     let mut r = Reader::new(body);
-    if r.utf()? != "PLAYER" {
-        return None; // сущность, статичный или прямой источник: к нику игрока не относятся
+    let ty = r.utf()?;
+    if !matches!(ty.as_str(), "PLAYER" | "STATIC" | "ENTITY" | "DIRECT") {
+        return None;
     }
     r.skip_utf()?; // addonId
     let id = read_uuid(&mut r)?;
-    if r.bool()? {
-        r.skip_utf()?; // name
-    }
+    let name = if r.bool()? { Some(r.utf()?) } else { None };
     r.u8()?; // state
     if r.bool()? {
         // CodecInfo: имя и параметры
@@ -212,23 +248,38 @@ fn parse_source_info(body: &[u8]) -> Option<(u128, VoicePlayer, bool)> {
     let group = line == &crate::plasmo::line_id(GROUPS_LINE)[..];
     r.bool()?; // iconVisible
     r.i32()?; // angle
-    Some((id, read_player(&mut r)?, group))
-}
-
-/// Ник игрока, которому принадлежит источник, если сервер уже сказал.
-pub fn source_nick(src: [u8; 16]) -> Option<String> {
-    let id = u128::from_be_bytes(src);
-    with(|ro| ro.sources.get(&id).map(|(nick, _)| nick.clone())).flatten()
+    let pos3 = |r: &mut Reader| Some([r.f64()?, r.f64()?, r.f64()?]);
+    match ty.as_str() {
+        "PLAYER" => {
+            let p = read_player(&mut r)?;
+            Some((id, Src::Player { nick: p.nick.clone(), group }, Some(p)))
+        }
+        "STATIC" => {
+            let pos = pos3(&mut r)?;
+            pos3(&mut r)?; // куда «смотрит» источник
+            Some((id, Src::Static { pos, name }, None))
+        }
+        "ENTITY" => Some((id, Src::Entity { id: r.i32()? as u32, name }, None)),
+        _ => {
+            // DIRECT: профиль отправителя (uuid, ник, свойства), смещение, относительно ли камеры
+            let sender = if r.bool()? {
+                read_uuid(&mut r)?;
+                let nick = r.utf()?;
+                let n = r.i32().filter(|n| (0..=100).contains(n))?;
+                for _ in 0..n * 3 {
+                    r.skip_utf()?;
+                }
+                Some(nick)
+            } else {
+                None
+            };
+            Some((id, Src::Direct { sender }, None))
+        }
+    }
 }
 
 /// Линия Plasmo, по которой идёт голос групп (аддон pv-addon-groups).
 pub const GROUPS_LINE: &str = "groups";
-
-/// Этот источник Plasmo — голос группы.
-pub fn source_is_group(src: [u8; 16]) -> bool {
-    let id = u128::from_be_bytes(src);
-    with(|ro| ro.sources.get(&id).is_some_and(|(_, g)| *g)).unwrap_or(false)
-}
 
 /// Наш UUID у Simple Voice Chat (из `voicechat:secret`).
 pub fn set_self_uuid(uuid: u128) {
@@ -236,6 +287,14 @@ pub fn set_self_uuid(uuid: u128) {
 }
 
 /// Группа Simple Voice Chat, в которой мы сейчас (если сервер её сообщил).
+/// Ники игроков в группе SVC `group` (по их состояниям от сервера), по алфавиту.
+pub fn group_members(group: u128) -> Vec<String> {
+    let mut v: Vec<String> =
+        with(|ro| ro.players.values().filter(|p| p.group == Some(group)).map(|p| p.nick.clone()).collect()).unwrap_or_default();
+    v.sort_by_key(|n| n.to_lowercase());
+    v
+}
+
 pub fn self_group() -> Option<u128> {
     with(|ro| ro.self_uuid.and_then(|me| ro.players.values().find(|p| p.uuid == me).and_then(|p| p.group))).flatten()
 }
@@ -468,7 +527,7 @@ mod tests {
         b.extend_from_slice(&0i32.to_be_bytes()); // angle
         player(&mut b, "Steve", [false, false, false]);
         assert!(on_source_info(&b));
-        assert_eq!(source_nick(src).as_deref(), Some("Steve"));
+        assert!(matches!(source(src), Some(Src::Player { ref nick, .. }) if nick == "Steve"));
         mark_talking("Steve");
         assert_eq!(status("steve"), Status::Talking);
         assert!(should_ask([5u8; 16]));
@@ -496,8 +555,8 @@ mod tests {
         };
         assert!(on_source_info(&info([1; 16], crate::plasmo::line_id(GROUPS_LINE), "Alex")));
         assert!(on_source_info(&info([2; 16], crate::plasmo::line_id("proximity"), "Steve")));
-        assert!(source_is_group([1; 16]));
-        assert!(!source_is_group([2; 16]));
+        assert!(matches!(source([1; 16]), Some(Src::Player { group: true, .. })));
+        assert!(matches!(source([2; 16]), Some(Src::Player { group: false, .. })));
         mark_talking("Alex");
         mark_talking_group("Alex");
         mark_talking("Steve");
@@ -505,6 +564,58 @@ mod tests {
         let g = |n: &str| list.iter().find(|p| p.nick == n).map(|p| p.group);
         assert_eq!(g("Alex"), Some(true), "говорил в группе");
         assert_eq!(g("Steve"), Some(false));
+    }
+
+    #[test]
+    fn world_sources_are_parsed() {
+        let _g = ONE_AT_A_TIME.lock_ok();
+        reset();
+        let head = |ty: &str, src: u8, name: Option<&str>| {
+            let mut b = Vec::new();
+            utf(&mut b, ty);
+            utf(&mut b, "pv-addon-discs");
+            b.extend_from_slice(&[src; 16]);
+            match name {
+                Some(n) => {
+                    b.push(1);
+                    utf(&mut b, n);
+                }
+                None => b.push(0),
+            }
+            b.push(0); // state
+            b.push(0); // без CodecInfo
+            b.push(1); // stereo
+            b.extend_from_slice(&crate::plasmo::line_id("discs"));
+            b.push(1); // iconVisible
+            b.extend_from_slice(&0i32.to_be_bytes());
+            b
+        };
+        // пластинка в проигрывателе: точка + направление
+        let mut st = head("STATIC", 1, Some("Track"));
+        for v in [10.5f64, 64.0, -3.5, 0.0, 0.0, 1.0] {
+            st.extend_from_slice(&v.to_be_bytes());
+        }
+        assert!(on_source_info(&st));
+        assert_eq!(source([1; 16]), Some(Src::Static { pos: [10.5, 64.0, -3.5], name: Some("Track".into()) }));
+        // сущность
+        let mut en = head("ENTITY", 2, None);
+        en.extend_from_slice(&77i32.to_be_bytes());
+        assert!(on_source_info(&en));
+        assert_eq!(source([2; 16]), Some(Src::Entity { id: 77, name: None }));
+        // прямой: отправитель с одним свойством, без смещения
+        let mut di = head("DIRECT", 3, None);
+        di.push(1);
+        di.extend_from_slice(&[9u8; 16]);
+        utf(&mut di, "Admin");
+        di.extend_from_slice(&1i32.to_be_bytes());
+        for t in ["textures", "v", "sig"] {
+            utf(&mut di, t);
+        }
+        di.push(0); // без смещения
+        di.push(0); // не относительно камеры
+        assert!(on_source_info(&di));
+        assert_eq!(source([3; 16]), Some(Src::Direct { sender: Some("Admin".into()) }));
+        assert!(!on_source_info(&head("UNKNOWN", 4, None)));
     }
 
     #[test]

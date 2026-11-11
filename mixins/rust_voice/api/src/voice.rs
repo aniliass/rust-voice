@@ -7,7 +7,7 @@ use cpal::{BufferSize, SampleRate, StreamConfig};
 use rusty_opus::{Application, OpusDecoder, OpusEncoder, SignalType};
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
-use std::net::UdpSocket;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -15,9 +15,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub const RATE: u32 = 48_000;
 /// 20 мс при 48 кГц, моно.
 pub const FRAME: usize = 960;
+/// Активация нейросетью: с какой уверенности в речи включаемся и до какой держимся; тише `VAD_FLOOR`
+/// (около −56 дБ) — никогда (нейросеть иногда видит «речь» в почти тишине).
+const VAD_START: f32 = 0.6;
+const VAD_KEEP: f32 = 0.3;
+const VAD_FLOOR: f32 = 0.0016;
 const MAX_QUEUE: usize = RATE as usize; // не больше секунды в очереди
 const PREFILL_FRAMES: usize = 3; // сколько кадров копим перед воспроизведением источника
 /// Сколько UDP может молчать, прежде чем сессия считается мёртвой (сервер шлёт keep-alive раз в 2-4 с).
+/// Сколько кадров голоса SVC можно придержать (~1,5 с), пока выход из группы или возвращение в пути.
+const SVC_HOLD_MAX: usize = 75;
 const STALE_AFTER: Duration = Duration::from_secs(15);
 /// Файл-выключатель микрофона: пока `~/.config/horizon-voice-mod.mute` существует, микрофон молчит.
 fn mute_file() -> std::path::PathBuf {
@@ -35,6 +42,8 @@ pub struct SessionConfig {
     pub activation_id: [u8; 16],
     pub distance: i16,
     pub bitrate: i32,
+    /// Без сервера: только проверка звука (`Link::Offline`), «подключено» не показываем.
+    pub offline: bool,
 }
 
 pub struct VoiceCtl {
@@ -74,17 +83,47 @@ pub enum Link {
         /// Как часто сервер шлёт KeepAlive (мс): если молчит в 10 раз дольше, сессия мертва.
         keep_alive_ms: i32,
     },
+    /// Без сервера: микрофон и динамики работают только для «Проверки звука» в меню, на сеть ничего не уходит.
+    Offline,
 }
 
 impl Link {
     fn addr(&self) -> String {
         match self {
-            Link::Plasmo(c) => format!("{}:{}", c.ip, c.port),
-            Link::Svc { host, port, .. } => {
-                if host.contains(':') { format!("[{host}]:{port}") } else { format!("{host}:{port}") }
-            }
+            Link::Plasmo(c) => host_port(&c.ip, c.port),
+            // сокет нужен коду ниже, но в него ничего не пишем
+            Link::Offline => "127.0.0.1:9".to_string(),
+            Link::Svc { host, port, .. } => host_port(host, port),
         }
     }
+}
+
+/// «адрес:порт» для UDP. IPv6 — в квадратных скобках, иначе двоеточия адреса спутаются с портом.
+fn host_port(host: &str, port: impl std::fmt::Display) -> String {
+    let h = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if h.contains(':') { format!("[{h}]:{port}") } else { format!("{h}:{port}") }
+}
+
+/// Локальный адрес того же семейства, что и сервер: IPv4-сокет (`0.0.0.0`) до IPv6-сервера не достучится.
+fn local_bind_addr(remote: &SocketAddr) -> SocketAddr {
+    match remote {
+        SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+        SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+    }
+}
+
+/// UDP-сокет к серверу голоса: сначала узнаём адрес (имя может дать и IPv4, и IPv6), потом открываем
+/// сокет под его семейство. Пробуем адреса по очереди, пока какой-нибудь не подойдёт.
+fn connect_udp(addr: &str) -> Result<UdpSocket, String> {
+    let targets = addr.to_socket_addrs().map_err(|e| format!("адрес {addr}: {e}"))?;
+    let mut last = format!("адрес {addr}: не нашёлся");
+    for t in targets {
+        match UdpSocket::bind(local_bind_addr(&t)).and_then(|s| s.connect(t).map(|_| s)) {
+            Ok(s) => return Ok(s),
+            Err(e) => last = format!("connect {t}: {e}"),
+        }
+    }
+    Err(last)
 }
 
 /// Запускает рабочий поток для новой UDP-сессии. Старый поток остановится, когда его `VoiceCtl` уничтожат.
@@ -119,6 +158,63 @@ enum Res {
     Not,
     Activated,
     End,
+}
+
+/// Что делать с кадром на сервере SVC. Сервер отдаёт голос того, кто в группе, группе (в «открытой» —
+/// ещё и тем, кто рядом), поэтому шлём одним потоком, а «только рядом» в обычной группе делается так: пока
+/// говорит «Локальный», мод выходит из группы и возвращается после (groups.rs). `route` — `groups::ROUTE_*`,
+/// `can_detach` — из группы можно так выйти. Возвращает (в группе говорит «Локальный» — для groups.rs;
+/// голос придержан до выхода или возвращения — его надо накопить и отправить следом).
+fn svc_route(
+    decisions: &mut [(usize, Res, settings::ActKind)],
+    acts: &[plasmo::Activation],
+    in_group: bool,
+    route: u8,
+    can_detach: bool,
+    active: &dyn Fn(&[u8; 16]) -> bool,
+) -> (bool, bool) {
+    let on = |d: &(usize, Res, settings::ActKind), near: bool| acts[d.0].proximity == near && d.1 == Res::Activated;
+    let group_on = decisions.iter().any(|d| on(d, false));
+    let local_on = decisions.iter().any(|d| on(d, true));
+    let any = group_on || local_on;
+    let wanted = local_on && !group_on;
+    let stop = |d: &mut (usize, Res, settings::ActKind)| {
+        d.1 = if active(&acts[d.0].id) { Res::End } else { Res::Not };
+    };
+    let has_group_act = decisions.iter().any(|d| !acts[d.0].proximity);
+    let mut held = false;
+    match route {
+        // выходим из группы или возвращаемся: голос ждёт
+        crate::groups::ROUTE_TRANSIT => {
+            held = any;
+            decisions.iter_mut().for_each(stop);
+        }
+        // временно вне группы: только «Локальный»; «Группы» ждёт возвращения
+        crate::groups::ROUTE_LOCAL => {
+            held = group_on;
+            decisions.iter_mut().filter(|d| !acts[d.0].proximity).for_each(stop);
+        }
+        // в группе заговорил «Локальный»: ждём, пока сервер выпустит из группы
+        _ if in_group && has_group_act && wanted && can_detach => {
+            held = true;
+            decisions.iter_mut().for_each(stop);
+        }
+        _ if in_group && has_group_act => {
+            // в группе: всё, что сработало, — одним потоком по линии «Группы» (голос с предзаписью важнее клавиши)
+            let kinds: Vec<settings::ActKind> = decisions.iter().filter(|d| d.1 == Res::Activated).map(|d| d.2).collect();
+            let kind = kinds.iter().copied().find(|k| *k == settings::ActKind::Voice).or(kinds.first().copied());
+            for d in decisions.iter_mut() {
+                if acts[d.0].proximity {
+                    stop(d);
+                } else if let Some(k) = kind {
+                    d.1 = Res::Activated;
+                    d.2 = k;
+                }
+            }
+        }
+        _ => decisions.iter_mut().filter(|d| !acts[d.0].proximity && d.1 == Res::Activated).for_each(stop),
+    }
+    (wanted && in_group, held)
 }
 
 /// Решение для одного кадра: какие активации передают и какие замолчали.
@@ -182,11 +278,28 @@ struct SrcQueue {
     sp: dsp::Spatializer,
     /// Голос привязан к месту в мире (игрок рядом). Группа SVC — нет: звучит ровно, по центру.
     positional: bool,
+    /// Действует ползунок «Локальный»: голоса рядом и проверка звука. Не группы и не звуки мира —
+    /// у них свои ползунки.
+    local: bool,
 }
 
 impl SrcQueue {
     fn new(gain: f32) -> SrcQueue {
-        SrcQueue { q: VecDeque::new(), started: false, gain, nick: None, max_dist: 0.0, sp: dsp::Spatializer::new(), positional: true }
+        SrcQueue {
+            q: VecDeque::new(),
+            started: false,
+            gain,
+            nick: None,
+            max_dist: 0.0,
+            sp: dsp::Spatializer::new(),
+            positional: true,
+            local: false,
+        }
+    }
+
+    /// Громкость с учётом ползунка «Локальный» (`local_vol`), если он к этому источнику относится.
+    fn effective_gain(&self, local_vol: f32) -> f32 {
+        if self.local { self.gain * local_vol } else { self.gain }
     }
 }
 
@@ -209,7 +322,15 @@ struct Audio {
     sources: HashMap<[u8; 16], Source>,
     /// Потоки голоса по активациям: идёт ли сейчас передача и номер последнего пакета.
     streams: HashMap<[u8; 16], ActStream>,
+    /// SVC: один счётчик пакетов на весь микрофон (сервер не знает наших «активаций»).
+    svc_seq: i64,
+    /// SVC: голос, придержанный, пока мод выходит из группы или возвращается в неё.
+    svc_hold: Vec<Vec<f32>>,
     speaking: bool,
+    /// Активация нейросетью: сейчас «говорим» (гистерезис: включаемся увереннее, чем выключаемся).
+    vad_open: bool,
+    /// Уверенность нейросети в прошлом кадре: включаемся, только если речь два кадра подряд (щелчок — один).
+    vad_prev: f32,
     /// Когда передавать: предзапись, гистерезис, мягкие края (`dsp::Gate`).
     gate: dsp::Gate,
     /// Какой по счёту профиль шума уже применён (settings::noise_profile_gen).
@@ -217,6 +338,8 @@ struct Audio {
     packet: [u8; 1500],
     /// Шумоподавление микрофона (сила в настройках, 0 — выключено).
     ns: denoise::Denoiser,
+    /// Шумодав нейросетью (RNNoise), если он выбран в меню.
+    rnn: Option<crate::rnnoise::Rnnoise>,
     /// Фильтр гула и автогромкость (переключатели во вкладке «Устройства»).
     hum: dsp::HighPass,
     agc: dsp::Agc,
@@ -252,12 +375,12 @@ fn parse_pactl_sources(text: &str) -> Vec<(String, String)> {
 }
 
 /// Микрофоны для меню: (значение в конфиге, название). Источники PipeWire/Pulse идут как `pulse:<имя>`.
-fn input_names() -> Vec<(String, String)> {
+pub fn input_names() -> Vec<(String, String)> {
     device_names(true)
 }
 
 /// Устройства вывода для меню, так же, как микрофоны (синки PipeWire/Pulse идут как `pulse:<имя>`).
-fn output_names() -> Vec<(String, String)> {
+pub fn output_names() -> Vec<(String, String)> {
     device_names(false)
 }
 
@@ -350,23 +473,34 @@ fn open_input(mic: &Arc<Mutex<VecDeque<f32>>>, log: &Logger) -> Option<cpal::Str
     };
     let input = device.and_then(|d| {
         let name = d.name().unwrap_or_default();
-        let mic = Arc::clone(mic);
-        let s = d
-            .build_input_stream(
-                &config,
-                move |data: &[f32], _| {
-                    let mut q = mic.lock_ok();
-                    q.extend(data.iter().copied());
-                    if q.len() > MAX_QUEUE {
-                        let n = q.len() - MAX_QUEUE;
-                        q.drain(..n);
-                    }
-                },
-                |e| eprintln!("ошибка микрофона: {e}"),
-                None,
-            )
-            .map_err(|e| log(format!("микрофон «{name}» не открылся: {e}")))
-            .ok()?;
+        let push = {
+            let mic = Arc::clone(mic);
+            move |samples: &mut dyn Iterator<Item = f32>| {
+                let mut q = mic.lock_ok();
+                q.extend(samples);
+                if q.len() > MAX_QUEUE {
+                    let n = q.len() - MAX_QUEUE;
+                    q.drain(..n);
+                }
+            }
+        };
+        // сначала как нам удобно: моно, 48 кГц
+        let direct = push.clone();
+        let built = d.build_input_stream(
+            &config,
+            move |data: &[f32], _| direct(&mut data.iter().copied()),
+            |e| eprintln!("ошибка микрофона: {e}"),
+            None,
+        );
+        let s = match built {
+            Ok(s) => s,
+            Err(e) => {
+                // Windows (WASAPI) и некоторые устройства открываются только в родном формате: берём его,
+                // сводим каналы в моно и пересчитываем частоту в 48 кГц сами
+                log(format!("микрофон «{name}» не открылся как моно 48 кГц ({e}), пробую родной формат"));
+                open_input_native(&d, push, log).map_err(|e| log(format!("микрофон «{name}» не открылся: {e}"))).ok()?
+            }
+        };
         s.play().ok()?;
         log(format!("микрофон: {name} ({})", if wanted.is_empty() { "по умолчанию" } else { wanted.as_str() }));
         Some(s)
@@ -378,6 +512,120 @@ fn open_input(mic: &Arc<Mutex<VecDeque<f32>>>, log: &Logger) -> Option<cpal::Str
         log("микрофона нет: говорить не сможешь, слушать сможешь".into());
     }
     input
+}
+
+/// Микрофон в его родном формате (каналы, частота, тип сэмплов): сводим в моно и пересчитываем в 48 кГц.
+fn open_input_native(
+    d: &cpal::Device,
+    push: impl FnMut(&mut dyn Iterator<Item = f32>) + Send + 'static,
+    log: &Logger,
+) -> Result<cpal::Stream, String> {
+    let def = d.default_input_config().map_err(|e| e.to_string())?;
+    let (channels, rate) = (def.channels().max(1) as usize, def.sample_rate().0);
+    log(format!("микрофон: родной формат {channels} кан., {rate} Гц, {:?}", def.sample_format()));
+    let config: StreamConfig = def.config();
+    let state = Arc::new(Mutex::new((dsp::Resampler::<1>::new(rate, RATE), push, Vec::<[f32; 1]>::new(), Vec::<f32>::new())));
+    let feed = move |data: &mut dyn Iterator<Item = f32>| {
+        let mut g = state.lock_ok();
+        let (rs, push, frames, out) = &mut *g;
+        frames.clear();
+        let mut acc = 0.0;
+        for (i, v) in data.enumerate() {
+            acc += v;
+            if (i + 1) % channels == 0 {
+                frames.push([acc / channels as f32]);
+                acc = 0.0;
+            }
+        }
+        out.clear();
+        rs.push(frames, &mut |f| out.push(f[0]));
+        push(&mut out.iter().copied());
+    };
+    let err = |e| eprintln!("ошибка микрофона: {e}");
+    let s = match def.sample_format() {
+        cpal::SampleFormat::F32 => {
+            let feed = feed;
+            d.build_input_stream(&config, move |data: &[f32], _| feed(&mut data.iter().copied()), err, None)
+        }
+        cpal::SampleFormat::I16 => {
+            let feed = feed;
+            d.build_input_stream(&config, move |data: &[i16], _| feed(&mut data.iter().map(|&v| v as f32 / 32_768.0)), err, None)
+        }
+        cpal::SampleFormat::U16 => {
+            let feed = feed;
+            d.build_input_stream(
+                &config,
+                move |data: &[u16], _| feed(&mut data.iter().map(|&v| (v as f32 - 32_768.0) / 32_768.0)),
+                err,
+                None,
+            )
+        }
+        other => return Err(format!("формат {other:?} не поддерживается")),
+    };
+    s.map_err(|e| e.to_string())
+}
+
+/// Вывод в родном формате устройства: сводим голоса в 48 кГц стерео, пересчитываем в его частоту
+/// и раскладываем по его каналам (левый, правый, остальные — тишина).
+fn open_output_native(d: &cpal::Device, play: &Arc<Mutex<Queues>>, log: &Logger) -> Result<(cpal::Stream, bool), String> {
+    let def = d.default_output_config().map_err(|e| e.to_string())?;
+    let (channels, rate) = (def.channels().max(1) as usize, def.sample_rate().0);
+    log(format!("вывод: родной формат {channels} кан., {rate} Гц, {:?}", def.sample_format()));
+    let config: StreamConfig = def.config();
+    let play = Arc::clone(play);
+    let stereo = channels >= 2;
+    // готовые кадры в частоте устройства, ещё не отданные
+    let mut ready: VecDeque<[f32; 2]> = VecDeque::new();
+    let mut rs = dsp::Resampler::<2>::new(RATE, rate);
+    let mut chunk = vec![0f32; 256 * 2];
+    let mut frames: Vec<[f32; 2]> = Vec::with_capacity(256);
+    let mut fill = move |n_frames: usize, out: &mut dyn FnMut(usize, [f32; 2])| {
+        while ready.len() < n_frames {
+            mix_output(&play, &mut chunk, 2);
+            frames.clear();
+            frames.extend(chunk.chunks_exact(2).map(|c| [c[0], c[1]]));
+            rs.push(&frames, &mut |f| ready.push_back(f));
+        }
+        for i in 0..n_frames {
+            let f = ready.pop_front().unwrap_or([0.0, 0.0]);
+            let f = if stereo { f } else { [(f[0] + f[1]) * 0.5, 0.0] };
+            out(i, f);
+        }
+    };
+    let err = |e| eprintln!("ошибка вывода: {e}");
+    let s = match def.sample_format() {
+        cpal::SampleFormat::F32 => d.build_output_stream(
+            &config,
+            move |data: &mut [f32], _| {
+                data.fill(0.0);
+                fill(data.len() / channels, &mut |i, f| {
+                    data[i * channels] = f[0];
+                    if channels >= 2 {
+                        data[i * channels + 1] = f[1];
+                    }
+                });
+            },
+            err,
+            None,
+        ),
+        cpal::SampleFormat::I16 => d.build_output_stream(
+            &config,
+            move |data: &mut [i16], _| {
+                data.fill(0);
+                let to = |v: f32| (v.clamp(-1.0, 1.0) * 32_767.0) as i16;
+                fill(data.len() / channels, &mut |i, f| {
+                    data[i * channels] = to(f[0]);
+                    if channels >= 2 {
+                        data[i * channels + 1] = to(f[1]);
+                    }
+                });
+            },
+            err,
+            None,
+        ),
+        other => return Err(format!("формат {other:?} не поддерживается")),
+    };
+    s.map(|s| (s, stereo)).map_err(|e| e.to_string())
 }
 
 /// Открывает вывод на устройство из меню (пусто — системное). Сначала стерео (для направленного звука),
@@ -422,7 +670,22 @@ fn open_output(play: &Arc<Mutex<Queues>>, log: &Logger) -> Option<cpal::Stream> 
                 Err(e) => log(format!("вывод «{name}» ({channels} кан.) не открылся: {e}")),
             }
         }
-        None
+        // Windows (WASAPI) и некоторые устройства открываются только в родном формате
+        match open_output_native(&d, play, log) {
+            Ok((s, stereo)) if s.play().is_ok() => {
+                settings::set_out_stereo(stereo);
+                log(format!("вывод: {name} (родной формат, {})", if stereo { "стерео" } else { "моно" }));
+                Some(s)
+            }
+            Ok(_) => {
+                log(format!("вывод «{name}» в родном формате не запустился"));
+                None
+            }
+            Err(e) => {
+                log(format!("вывод «{name}» в родном формате не открылся: {e}"));
+                None
+            }
+        }
     });
     if routed {
         unroute_input();
@@ -442,6 +705,7 @@ fn mix_output(play: &Arc<Mutex<Queues>>, data: &mut [f32], channels: usize) {
         hrtf: settings::hrtf_on(),
         occlusion: settings::occlusion_on(),
     };
+    let (vol, off) = (settings::voice_volume(), settings::voice_off());
     let mut qs = play.lock_ok();
     for src in qs.by_source.values_mut() {
         if !src.started {
@@ -456,16 +720,19 @@ fn mix_output(play: &Arc<Mutex<Queues>>, data: &mut [f32], channels: usize) {
         } else {
             dsp::Params::CENTER
         };
-        if src.sp.mix(&mut src.q, data, channels, src.gain, &target, mode) {
+        // голос без места (группа, проверка звука) — по центру и без HRTF: окраска ушей ему ни к чему
+        let m = if src.positional { mode } else { dsp::Mode { directional: false, ..mode } };
+        // «Локальный» — только голосам рядом: группы и музыку он не трогает (у них свои ползунки)
+        let gain = src.effective_gain(vol);
+        if src.sp.mix(&mut src.q, data, channels, gain, &target, m) {
             src.started = false;
         }
     }
-    // игрока, которого вы заглушили до 0%, «слышно» не считаем
-    settings::set_hearing(qs.by_source.values().filter(|e| e.started && e.gain > 0.0).count() as u32);
+    // игрока, которого вы заглушили до 0% (им самим или «Локальным»), «слышно» не считаем
+    settings::set_hearing(qs.by_source.values().filter(|e| e.started && e.effective_gain(vol) > 0.0).count() as u32);
     drop(qs);
-    let (vol, off) = (settings::voice_volume(), settings::voice_off());
     for v in data.iter_mut() {
-        *v = if off { 0.0 } else { dsp::soft_limit(*v * vol).clamp(-1.0, 1.0) };
+        *v = if off { 0.0 } else { dsp::soft_limit(*v).clamp(-1.0, 1.0) };
     }
 }
 
@@ -490,7 +757,7 @@ impl Audio {
         settings::set_mic_list(input_names());
         settings::set_out_list(output_names());
         settings::set_distance(cfg.distance.max(0) as u32);
-        settings::set_connected(true);
+        settings::set_connected(!cfg.offline);
         let enc = OpusEncoder::new(RATE as i32, 1, Application::Voip).ok().map(|mut e| {
             e.bitrate_bps = if cfg.bitrate > 0 { cfg.bitrate } else { 24_000 };
             e.signal_type = Some(SignalType::Voice);
@@ -510,7 +777,11 @@ impl Audio {
             enc,
             sources: HashMap::new(),
             streams: HashMap::new(),
+            svc_seq: 0,
+            svc_hold: Vec::new(),
             speaking: false,
+            vad_open: false,
+            vad_prev: 0.0,
             gate: dsp::Gate::new(),
             profile_gen: settings::noise_profile_gen(),
             packet: [0u8; 1500],
@@ -519,6 +790,7 @@ impl Audio {
                 d.set_profile(settings::noise_profile());
                 d
             },
+            rnn: None,
             hum: dsp::HighPass::new(80.0),
             agc: dsp::Agc::new(),
         }
@@ -551,6 +823,7 @@ impl Audio {
             self._in_stream = None; // старый поток закрываем до открытия нового
             self.mic.lock_ok().clear();
             self.ns.reset();
+            self.rnn = None;
             self.hum.reset();
             self.agc.reset();
             self.gate.reset();
@@ -586,7 +859,19 @@ impl Audio {
                     settings::set_learn_progress(self.ns.learning());
                 }
             }
-            self.ns.process(&mut frame, noise);
+            // шумодав: нейросеть RNNoise (как в Plasmo) или своё спектральное; переключение — с чистого листа.
+            // Нейросеть нужна и для активации по голосу: тогда она идёт всегда (без шумодава — только слушает).
+            let ai_clean = settings::noise_ai() && noise > 0.0;
+            if ai_clean || settings::vad_ai() {
+                let r = self.rnn.get_or_insert_with(crate::rnnoise::Rnnoise::new);
+                r.process(&mut frame, if ai_clean { noise } else { 0.0 });
+                settings::set_speech(r.vad());
+                self.ns.process(&mut frame, if ai_clean { 0.0 } else { noise });
+            } else {
+                self.rnn = None;
+                settings::set_speech(0.0);
+                self.ns.process(&mut frame, noise);
+            }
             if (gain - 1.0).abs() > f32::EPSILON {
                 for v in frame.iter_mut() {
                     *v = (*v * gain).clamp(-1.0, 1.0);
@@ -594,10 +879,20 @@ impl Audio {
             }
             let rms = (frame.iter().map(|s| s * s).sum::<f32>() / FRAME as f32).sqrt();
             settings::set_level(rms); // меню рисует по нему полосу уровня
-            let loud = rms >= threshold;
+            // Активация: по нейросети (речь ли это, а не громко ли) или по порогу в дБ.
+            let (loud, by_ai) = if settings::vad_ai() {
+                let p = settings::speech();
+                let on = rms >= VAD_FLOOR && if self.vad_open { p >= VAD_KEEP } else { p >= VAD_START && self.vad_prev >= VAD_KEEP };
+                self.vad_prev = p;
+                self.vad_open = on;
+                (on, Some(on))
+            } else {
+                self.vad_open = false;
+                (rms >= threshold, None)
+            };
             let current = frame.clone();
             // Голосовой порог с гистерезисом и предзаписью — общий для всех активаций «по голосу».
-            let voice_frames = match self.gate.process(frame, rms, threshold, None, silenced) {
+            let voice_frames = match self.gate.process(frame, rms, threshold, by_ai, silenced) {
                 dsp::GateOut::Send(frames) => frames,
                 _ => Vec::new(),
             };
@@ -633,18 +928,53 @@ impl Audio {
             });
         }
         let streams = &self.streams;
-        let decisions = decide(
+        let mut decisions = decide(
             &acts,
             !voice_frames.is_empty(),
             &|slot| settings::slot_held(slot),
             &|id| streams.get(id).is_some_and(|s| s.active),
             silenced,
         );
+        // SVC: куда идёт голос, решает сервер — по группе (svc_route). Голос, придержанный на время выхода из
+        // группы или возвращения, копится и уходит следом, как только линия готова: начало фразы не теряется.
+        let mut flush: Vec<Vec<f32>> = Vec::new();
+        if matches!(link, Link::Svc { .. }) {
+            use std::sync::atomic::Ordering::Relaxed;
+            let would_voice = decisions.iter().any(|&(_, r, k)| r == Res::Activated && k == settings::ActKind::Voice);
+            let route = crate::groups::SVC_ROUTE.load(Relaxed);
+            let in_group = roster::self_group().is_some() || route != crate::groups::ROUTE_NORMAL;
+            let (wanted, held) = svc_route(
+                &mut decisions,
+                &acts,
+                in_group,
+                route,
+                crate::groups::SVC_CAN_DETACH.load(Relaxed),
+                &|id| streams.get(id).is_some_and(|s| s.active),
+            );
+            crate::groups::SVC_LOCAL_WANTED.store(wanted, Relaxed);
+            if held {
+                let frames = if would_voice { voice_frames.clone() } else { vec![current.clone()] };
+                self.svc_hold.extend(frames);
+                let over = self.svc_hold.len().saturating_sub(SVC_HOLD_MAX);
+                self.svc_hold.drain(..over);
+            } else if !self.svc_hold.is_empty() {
+                flush = std::mem::take(&mut self.svc_hold);
+                // уже замолчали — придержанное всё равно уходит, по той линии, куда идёт голос сейчас
+                if !decisions.iter().any(|d| d.1 == Res::Activated) {
+                    let to_group = route == crate::groups::ROUTE_NORMAL && roster::self_group().is_some();
+                    if let Some(d) = decisions.iter_mut().find(|d| acts[d.0].proximity != to_group) {
+                        d.1 = Res::Activated;
+                        d.2 = settings::ActKind::Voice;
+                    }
+                }
+            }
+        }
         let any = decisions.iter().any(|d| d.1 == Res::Activated);
         // куда уходит голос: рядом или в группу (у Plasmo это разные активации, у SVC решает сервер по группе)
         let (near, group) = match link {
+            Link::Svc { .. } if crate::groups::SVC_ROUTE.load(std::sync::atomic::Ordering::Relaxed) == crate::groups::ROUTE_LOCAL => (any, false),
             Link::Svc { .. } if roster::self_group().is_some() => (false, any),
-            Link::Svc { .. } => (any, false),
+            Link::Svc { .. } | Link::Offline => (any, false),
             Link::Plasmo(_) => (
                 decisions.iter().any(|&(i, r, _)| r == Res::Activated && acts[i].proximity),
                 decisions.iter().any(|&(i, r, _)| r == Res::Activated && !acts[i].proximity),
@@ -656,7 +986,13 @@ impl Audio {
                 && (k == settings::ActKind::Voice || (k == settings::ActKind::Inherit && !settings::push_to_talk()))
         });
         // что кодируем: при голосе — кадры с предзаписью, иначе (только рация) — текущий кадр
+        // проверка звука: слышно всегда, без рации и порога (кадр уже прошёл шумодав и усиление)
+        let test_frame = settings::mic_test().then(|| current.clone());
         let mut timeline = if voice_used { voice_frames } else if any { vec![current] } else { Vec::new() };
+        if !flush.is_empty() {
+            flush.append(&mut timeline);
+            timeline = flush;
+        }
         if settings::agc_on() {
             let last = timeline.len().saturating_sub(1);
             for (i, f) in timeline.iter_mut().enumerate() {
@@ -664,15 +1000,17 @@ impl Audio {
             }
         }
 
-        if settings::mic_test() {
+        let offline = matches!(link, Link::Offline);
+        if settings::mic_test() || offline {
             // Проверка звука: слышите то же, что услышали бы другие, но на сервер ничего не уходит.
+            // Без сервера (`Link::Offline`) голос только для проверки — и тоже никуда не уходит.
             self.end_all(&acts, outbox);
-            if any {
+            if let Some(cur) = test_frame {
                 let mut qs = self.play.lock_ok();
                 let src = qs.by_source.entry(TEST_SOURCE).or_insert_with(|| SrcQueue::new(1.0));
-                for f in &timeline {
-                    src.q.extend(f.iter().copied());
-                }
+                src.local = true; // себя слышно с той же громкостью, что игроков рядом
+                // всегда текущий кадр: кадры активации с предзаписью повторили бы уже сыгранное
+                src.q.extend(cur.iter().copied());
                 if src.q.len() > MAX_QUEUE {
                     let n = src.q.len() - MAX_QUEUE;
                     src.q.drain(..n);
@@ -690,7 +1028,7 @@ impl Audio {
                         // Plasmo шифрует сам Opus, SVC — весь UDP-пакет целиком (ниже, при отправке)
                         packets.push(match link {
                             Link::Plasmo(_) => crypto::aes_encrypt(&self.cfg.aes, &self.packet[..len]),
-                            Link::Svc { .. } => self.packet[..len].to_vec(),
+                            Link::Svc { .. } | Link::Offline => self.packet[..len].to_vec(),
                         });
                     }
                 }
@@ -711,7 +1049,11 @@ impl Audio {
                         st.seq += 1;
                         let pkt = match link {
                             Link::Plasmo(c) => plasmo::udp_player_audio(&c.secret, now_ms(), st.seq, data, &a.id, distance),
-                            Link::Svc { session, .. } => session.wrap(svc::T_MIC, &svc::mic(data, st.seq, false)),
+                            Link::Svc { session, .. } => {
+                                self.svc_seq += 1;
+                                session.wrap(svc::T_MIC, &svc::mic(data, self.svc_seq, false))
+                            }
+                            Link::Offline => continue,
                         };
                         let _ = sock.send(&pkt);
                     }
@@ -754,15 +1096,28 @@ impl Audio {
     /// Чужой голос Plasmo: расшифровать, узнать, чей он, и сыграть.
     fn on_source_audio(&mut self, a: plasmo::SourceAudio, outbox: &Outbox) {
         let Some(opus) = crypto::aes_decrypt(&self.cfg.aes, &a.data) else { return };
-        // Чей это голос: известно из SourceInfo; пока не знаем, спрашиваем у сервера (SourceInfoRequest, тип 15).
-        let nick = roster::source_nick(a.source_id);
-        if nick.is_none() && roster::should_ask(a.source_id) {
+        // Чей это звук и где он: известно из SourceInfo; пока не знаем, спрашиваем у сервера (SourceInfoRequest, тип 15).
+        let src = roster::source(a.source_id);
+        if src.is_none() && roster::should_ask(a.source_id) {
             let mut ask = vec![15u8];
             ask.extend_from_slice(&a.source_id);
             outbox.lock_ok().push(ask);
         }
-        let group = roster::source_is_group(a.source_id);
-        self.play_voice(a.source_id, a.seq, &opus, a.distance.max(0) as f32, nick, !group, group);
+        let dist = a.distance.max(0) as f32;
+        match src {
+            Some(roster::Src::Player { nick, group }) => self.play_voice(a.source_id, a.seq, &opus, dist, Some(nick), !group, group),
+            // звук мира (пластинка pv-addon-discs, моб): ставим в его точку, со всеми фишками — стены, обход углов
+            Some(roster::Src::Static { pos, name }) => {
+                crate::notes::set_title(&spatial::emitter_key(&a.source_id), name.as_deref());
+                self.play_world(a.source_id, a.seq, &opus, dist, spatial::At::Pos(pos))
+            }
+            Some(roster::Src::Entity { id, name }) => {
+                crate::notes::set_title(&spatial::emitter_key(&a.source_id), name.as_deref());
+                self.play_world(a.source_id, a.seq, &opus, dist, spatial::At::Entity(id))
+            }
+            Some(roster::Src::Direct { sender }) => self.play_voice(a.source_id, a.seq, &opus, dist, sender, false, false),
+            None => self.play_voice(a.source_id, a.seq, &opus, dist, None, false, false),
+        }
     }
 
     /// Чужой голос SVC (Opus уже открыт: шифровался весь пакет). Имя — из состояний игроков SVC.
@@ -773,27 +1128,31 @@ impl Audio {
         self.play_voice(s.channel, s.seq, &s.opus, s.distance, nick, positional, group);
     }
 
-    /// Общая часть: декодировать Opus (с заполнением потерь) и положить в очередь воспроизведения.
-    #[allow(clippy::too_many_arguments)]
-    fn play_voice(
-        &mut self,
-        source_id: [u8; 16],
-        seq: i64,
-        opus: &[u8],
-        distance: f32,
-        nick: Option<String>,
-        positional: bool,
-        group: bool,
-    ) {
+    /// Звук мира (не голос): своя громкость «Музыка и звуки», в списке говорящих и над никами не отмечается.
+    fn play_world(&mut self, source_id: [u8; 16], seq: i64, opus: &[u8], distance: f32, at: spatial::At) {
+        let key = spatial::emitter_key(&source_id);
+        spatial::emit(&key, at);
+        settings::set_server_has_world(true); // звук мира пришёл: значит, его ползунок нужен
+        let Some(decoded) = self.decode(source_id, seq, opus) else { return };
+        // ноты над пластинкой вылетают в такт: громкость кадра
+        let rms = (decoded.iter().map(|s| s * s).sum::<f32>() / decoded.len().max(1) as f32).sqrt();
+        crate::notes::on_audio(&key, rms);
+        // выбор взглядом: тот, на который смотрим, громко, остальные рядом — тихо фоном
+        let gain = settings::music_volume_pct() as f32 / 100.0 * crate::notes::focus_gain(&key);
+        self.enqueue(source_id, decoded, gain, distance, Some(key), true, false);
+    }
+
+    /// Декодировать Opus источника (с заполнением потерь). `None` — старый или повторный пакет.
+    fn decode(&mut self, source_id: [u8; 16], seq: i64, opus: &[u8]) -> Option<Vec<f32>> {
         let src = match self.sources.get_mut(&source_id) {
             Some(s) => s,
             None => {
-                let Ok(dec) = OpusDecoder::new(RATE as i32, 1) else { return };
+                let dec = OpusDecoder::new(RATE as i32, 1).ok()?;
                 self.sources.entry(source_id).or_insert(Source { dec, last_seq: seq.saturating_sub(1), last_seen: Instant::now() })
             }
         };
         if seq <= src.last_seq {
-            return; // старый или повторный пакет
+            return None;
         }
         let gap = seq.saturating_sub(src.last_seq).saturating_sub(1).clamp(0, 3);
         src.last_seq = seq;
@@ -808,6 +1167,22 @@ impl Audio {
         if src.dec.decode(opus, FRAME, &mut pcm).is_ok() {
             decoded.extend_from_slice(&pcm);
         }
+        Some(decoded)
+    }
+
+    /// Общая часть: декодировать Opus (с заполнением потерь) и положить в очередь воспроизведения.
+    #[allow(clippy::too_many_arguments)]
+    fn play_voice(
+        &mut self,
+        source_id: [u8; 16],
+        seq: i64,
+        opus: &[u8],
+        distance: f32,
+        nick: Option<String>,
+        positional: bool,
+        group: bool,
+    ) {
+        let Some(decoded) = self.decode(source_id, seq, opus) else { return };
         if let Some(n) = &nick {
             roster::mark_talking(n);
             if group {
@@ -823,14 +1198,32 @@ impl Audio {
         let mut gain = nick.as_deref().map(settings::player_volume).unwrap_or(1.0);
         if group {
             gain *= settings::group_volume_pct() as f32 / 100.0; // ползунок «Группы» во вкладке «Громкость»
+            settings::set_server_has_groups(true);
         }
+        self.enqueue(source_id, decoded, gain, distance, nick, positional, !group);
+    }
+
+    /// Положить звук источника в очередь воспроизведения. `key` — ник игрока или ключ звука мира (`@…`):
+    /// по нему звук ставится в мир.
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue(
+        &mut self,
+        source_id: [u8; 16],
+        decoded: Vec<f32>,
+        gain: f32,
+        distance: f32,
+        key: Option<String>,
+        positional: bool,
+        local: bool,
+    ) {
         let mut qs = self.play.lock_ok();
         let src = qs.by_source.entry(source_id).or_insert_with(|| SrcQueue::new(gain));
         src.gain = gain;
         src.max_dist = distance.max(0.0);
         src.positional = positional;
-        if src.nick != nick {
-            src.nick = nick;
+        src.local = local;
+        if src.nick != key {
+            src.nick = key;
         }
         src.q.extend(decoded);
         if src.q.len() > MAX_QUEUE {
@@ -850,7 +1243,8 @@ impl Audio {
 /// Где UDP-сессия SVC: шлём Authenticate, потом ConnectionCheck, потом просто держим связь.
 enum SvcStage {
     Auth,
-    Check([u8; 16]),
+    /// Ждём ConnectionCheckAck; внутри — тело ConnectionCheck (nonce в 2.7, пусто в 2.6).
+    Check(Vec<u8>),
     Ready,
 }
 
@@ -863,10 +1257,13 @@ fn run(
     log: &Logger,
 ) -> Result<(), String> {
     let addr = conn.addr();
-    let sock = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("bind: {e}"))?;
-    sock.connect(&addr).map_err(|e| format!("connect {addr}: {e}"))?;
+    let sock = connect_udp(&addr)?;
     sock.set_read_timeout(Some(Duration::from_millis(10))).map_err(|e| e.to_string())?;
-    let proto = if matches!(conn, Link::Svc { .. }) { "Simple Voice Chat" } else { "Plasmo Voice" };
+    let proto = match conn {
+        Link::Svc { .. } => "Simple Voice Chat",
+        Link::Plasmo(_) => "Plasmo Voice",
+        Link::Offline => "без сервера, проверка звука",
+    };
     log(format!("UDP-сессия к {addr} ({proto})"));
 
     let mut audio: Option<Audio> = None;
@@ -883,6 +1280,7 @@ fn run(
     let stale_after = match &conn {
         Link::Svc { keep_alive_ms, .. } => Duration::from_millis((*keep_alive_ms).clamp(500, 30_000) as u64 * 10),
         Link::Plasmo(_) => STALE_AFTER,
+        Link::Offline => Duration::from_secs(24 * 3600),
     };
 
     while !stop.load(Ordering::Relaxed) {
@@ -899,10 +1297,10 @@ fn run(
                 if last_ping.elapsed() >= Duration::from_secs(1) {
                     match &svc_stage {
                         SvcStage::Auth => {
-                            let _ = sock.send(&session.wrap(svc::T_AUTHENTICATE, &[]));
+                            let _ = sock.send(&session.wrap(svc::T_AUTHENTICATE, &session.authenticate_body()));
                         }
-                        SvcStage::Check(nonce) => {
-                            let _ = sock.send(&session.wrap(svc::T_CONNECTION_CHECK, &svc::connection_check(nonce)));
+                        SvcStage::Check(body) => {
+                            let _ = sock.send(&session.wrap(svc::T_CONNECTION_CHECK, body));
                         }
                         SvcStage::Ready => {}
                     }
@@ -910,6 +1308,7 @@ fn run(
                     last_ping = Instant::now();
                 }
             }
+            Link::Offline => {}
         }
         while let Ok(cfg) = rx.try_recv() {
             log(format!(
@@ -922,6 +1321,7 @@ fn run(
         if let Ok(n) = sock.recv(&mut buf) {
             got += 1;
             match &conn {
+                Link::Offline => {}
                 Link::Plasmo(_) => {
                     last_rx = Instant::now();
                     match plasmo::udp_split(&buf[..n]) {
@@ -942,9 +1342,9 @@ fn run(
                         by_type[(ty as usize).min(11)] += 1;
                         match ty {
                             svc::T_AUTHENTICATE_ACK => {
-                                if let (SvcStage::Auth, Some(nonce)) = (&svc_stage, svc::parse_auth_ack(&body)) {
+                                if let (SvcStage::Auth, Some(check)) = (&svc_stage, session.auth_ack(&body)) {
                                     log("SVC: сервер принял ключ, проверяю связь".into());
-                                    svc_stage = SvcStage::Check(nonce);
+                                    svc_stage = SvcStage::Check(check);
                                     last_ping = Instant::now() - Duration::from_secs(2);
                                 }
                             }
@@ -1051,6 +1451,43 @@ mod tests {
         d.iter().find(|x| acts[x.0].name == name).map(|x| x.1).unwrap()
     }
 
+    #[test]
+    fn local_slider_does_not_touch_groups_or_music() {
+        let mut near = SrcQueue::new(0.8);
+        near.local = true;
+        let group = SrcQueue::new(0.5); // «Группы» уже в gain, «Локальный» не действует
+        let music = SrcQueue::new(0.7);
+        assert_eq!(near.effective_gain(0.0), 0.0, "«Локальный» 0% глушит голоса рядом");
+        assert_eq!(group.effective_gain(0.0), 0.5, "…но не группы");
+        assert_eq!(music.effective_gain(0.0), 0.7, "…и не музыку");
+        assert_eq!(near.effective_gain(1.5), 0.8 * 1.5);
+    }
+
+    #[test]
+    fn udp_address_keeps_ipv6_apart_from_port() {
+        assert_eq!(host_port("5.83.140.202", 24454), "5.83.140.202:24454");
+        assert_eq!(host_port("2001:db8::1", 24454), "[2001:db8::1]:24454");
+        assert_eq!(host_port("[2001:db8::1]", 24454), "[2001:db8::1]:24454", "скобки не удваиваются");
+        assert_eq!(host_port("voice.example.org", 24454), "voice.example.org:24454");
+        let v4: SocketAddr = "5.83.140.202:24454".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::1]:24454".parse().unwrap();
+        assert!(local_bind_addr(&v4).is_ipv4());
+        assert!(local_bind_addr(&v6).is_ipv6());
+        assert_eq!(local_bind_addr(&v6).port(), 0);
+    }
+
+    #[test]
+    fn udp_socket_matches_server_address_family() {
+        let s = connect_udp("127.0.0.1:9").unwrap();
+        assert!(s.local_addr().unwrap().is_ipv4());
+        // IPv6 может быть выключен на машине с тестами: тогда проверять нечего
+        if UdpSocket::bind("[::1]:0").is_ok() {
+            let s = connect_udp(&host_port("::1", 9)).unwrap();
+            assert!(s.local_addr().unwrap().is_ipv6(), "к IPv6-серверу — IPv6-сокет");
+        }
+        assert!(connect_udp("not a host").is_err());
+    }
+
     /// Поддельный сервер SVC на 127.0.0.1: проверяем, что клиент проходит рукопожатие (Authenticate ->
     /// ConnectionCheck с тем же nonce) и отвечает на KeepAlive, всё в формате сервера (без id соединения).
     #[test]
@@ -1099,6 +1536,42 @@ mod tests {
     }
 
     #[test]
+    fn svc_local_in_a_normal_group_waits_for_detach() {
+        use crate::groups::{ROUTE_LOCAL, ROUTE_NORMAL, ROUTE_TRANSIT};
+        use settings::ActKind::{Ptt, Voice};
+        let a = |name: &str, proximity: bool| plasmo::Activation {
+            name: name.into(),
+            translation: String::new(),
+            id: plasmo::activation_id(name),
+            distances: vec![],
+            default_distance: 48,
+            proximity,
+            transitive: true,
+            stereo: false,
+            weight: if proximity { 1 } else { 10 },
+        };
+        let acts = vec![a("groups", false), a(settings::PROXIMITY, true)];
+        let run = |g: Res, l: Res, lk, in_group, route, can| {
+            let mut d = vec![(0, g, Ptt), (1, l, lk)];
+            let (w, held) = svc_route(&mut d, &acts, in_group, route, can, &|_| false);
+            (d[0].1, d[1].1, w, held)
+        };
+        use Res::{Activated as A, Not as N};
+        // в группе: «Группы» — группе; «Локальный» (клавиша или голос) — ждём выхода, голос копится
+        assert_eq!(run(A, N, Ptt, true, ROUTE_NORMAL, true), (A, N, false, false));
+        assert_eq!(run(N, A, Ptt, true, ROUTE_NORMAL, true), (N, N, true, true));
+        assert_eq!(run(N, A, Voice, true, ROUTE_NORMAL, true), (N, N, true, true));
+        // выйти нельзя (не обычная группа, пароль неизвестен, в группе никого) — в группу
+        assert_eq!(run(N, A, Ptt, true, ROUTE_NORMAL, false), (A, N, true, false));
+        // в пути — копим; вне группы на время — только рядом, «Группы» ждёт
+        assert_eq!(run(N, A, Ptt, true, ROUTE_TRANSIT, true), (N, N, true, true));
+        assert_eq!(run(N, A, Ptt, true, ROUTE_LOCAL, true), (N, A, true, false));
+        assert_eq!(run(A, N, Ptt, true, ROUTE_LOCAL, true), (N, N, false, true));
+        // не в группе — как обычно
+        assert_eq!(run(A, A, Ptt, false, ROUTE_NORMAL, true), (N, A, false, false));
+    }
+
+    #[test]
     fn activations_follow_plasmo_rules() {
         let acts = vec![act("groups", 5, false, false), act(settings::PROXIMITY, 1, true, true)];
         let none = |_: usize| false;
@@ -1130,5 +1603,21 @@ mod tests {
             parse_pactl_sources(text),
             vec![("alsa_input.usb-Blue_Yeti-00.analog-stereo".to_string(), "Blue Yeti Analog Stereo".to_string())]
         );
+    }
+}
+#[cfg(test)]
+mod offline_tests {
+    #[test]
+    fn offline_session_runs_without_network() {
+        let out = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log: super::Logger = std::sync::Arc::new(|_s: String| {});
+        let v = super::start(super::Link::Offline, out.clone(), log);
+        v.configure(super::SessionConfig { aes: [0; 16], activation_id: [0; 16], distance: 32, bitrate: 0, offline: true });
+        crate::settings::set_mic_test(true);
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert!(!crate::settings::connected(), "без сервера «подключено» не показываем");
+        assert!(out.lock().unwrap().is_empty(), "на сервер ничего не ушло");
+        crate::settings::set_mic_test(false);
+        drop(v);
     }
 }

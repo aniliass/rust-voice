@@ -15,10 +15,29 @@ static VOICE_VOLUME: AtomicU32 = AtomicU32::new(100); // проценты, 0..=2
 static OVERLAY_ON: AtomicBool = AtomicBool::new(true);
 /// Громкость источников-групп (строка «Группы» во вкладке «Громкость»), проценты 0..=200.
 static GROUP_VOLUME: AtomicU32 = AtomicU32::new(100);
+/// Громкость звуков мира от сервера: пластинки (pv-addon-discs), звуки сущностей.
+static MUSIC_VOLUME: AtomicU32 = AtomicU32::new(100);
 /// Шумоподавление микрофона, проценты 0..=100 (0 — выключено).
 static NOISE_PCT: AtomicU32 = AtomicU32::new(0);
+/// Шумодав нейросетью (RNNoise), иначе своё спектральное.
+static NOISE_AI: AtomicBool = AtomicBool::new(true);
 /// Значок статуса перед ником игрока над головой (говорит, замьючен, без мода).
 static NAMETAGS_ON: AtomicBool = AtomicBool::new(true);
+/// Ноты над пластинкой (звуки мира), см. `notes.rs`.
+static NOTES_ON: AtomicBool = AtomicBool::new(true);
+/// Значок микрофона над хотбаром (говорите, микрофон или звук выключены).
+static HOTBAR_ICON_ON: AtomicBool = AtomicBool::new(true);
+/// Табличка с названием трека над играющей пластинкой.
+static DISC_LABEL_ON: AtomicBool = AtomicBool::new(true);
+static DISC_GLOW_ON: AtomicBool = AtomicBool::new(true);
+static DISC_FOCUS_ON: AtomicBool = AtomicBool::new(true);
+static PIN_SOLO_ON: AtomicBool = AtomicBool::new(false);
+/// От кого показывать приглашения в группу (`InviteMode`).
+static INVITE_MODE: AtomicU8 = AtomicU8::new(0);
+/// От кого приглашения показываем в режиме «только от» (ники в нижнем регистре).
+static INVITE_ALLOW: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// От кого приглашения не показываем (ники в нижнем регистре).
+static INVITE_BLOCK: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// Выбранный микрофон по имени; пусто — системный по умолчанию.
 static MIC_DEVICE: Mutex<String> = Mutex::new(String::new());
 /// Микрофоны, которые нашла система: (значение для конфига, название для меню). Заполняет голосовой поток.
@@ -73,6 +92,10 @@ static PLAYERS_SCROLL: AtomicU32 = AtomicU32::new(0);
 
 // ---------- что происходит сейчас (пишет голосовой поток) ----------
 static LEVEL: AtomicU32 = AtomicU32::new(0); // f32: громкость микрофона (RMS) после усиления
+/// Активация по голосу нейросетью (RNNoise решает, речь ли это), иначе по порогу в дБ.
+static VAD_AI: AtomicBool = AtomicBool::new(false);
+/// Вероятность речи в последнем кадре по нейросети (0..1, как биты f32) — для полосы в меню.
+static SPEECH: AtomicU32 = AtomicU32::new(0);
 static SPEAKING: AtomicBool = AtomicBool::new(false);
 static HEARING: AtomicU32 = AtomicU32::new(0);
 static CONNECTED: AtomicBool = AtomicBool::new(false);
@@ -143,13 +166,14 @@ pub fn ptt_label_for(name: &str) -> String {
 // ---------- клавиши действий ----------
 /// Действия, которым можно назначить клавишу во вкладке «Клавиши»: (имя в конфиге, подпись).
 /// «menu» — открыть меню (без назначения берётся из Options > Mods, по умолчанию M).
-pub const ACTIONS: [(&str, &str); 6] = [
+pub const ACTIONS: [(&str, &str); 7] = [
     ("menu", "Открыть меню"),
     ("mute", "Выключить микрофон"),
     ("deafen", "Выключить голосовой чат"),
     ("occlusion", "Вкл/выкл заглушение"),
     ("dist_up", "Увеличить дистанцию"),
     ("dist_down", "Уменьшить дистанцию"),
+    ("pin_disc", "Закрепить пластинку"),
 ];
 
 pub fn action_binding(action: &str) -> Option<String> {
@@ -184,12 +208,14 @@ pub fn step_proximity_distance(up: bool) -> Option<i32> {
         return None;
     }
     let cur = act_distance(&a);
-    let i = choices.iter().position(|d| *d == cur).unwrap_or(0);
-    let j = if up { (i + 1) % choices.len() } else { (i + choices.len() - 1) % choices.len() };
+    let n = choices.len();
+    let i = choices.position(cur).unwrap_or(0);
+    let j = if up { (i + 1) % n } else { (i + n - 1) % n };
+    let d = choices.get(j)?;
     let mut p = act_pref(PROXIMITY);
-    p.distance = Some(choices[j]);
+    p.distance = Some(d);
     set_act_pref(PROXIMITY, p);
-    Some(choices[j])
+    Some(d)
 }
 
 /// Говорящие в группе — отдельным списком слева, остальные справа (иначе один общий список).
@@ -216,17 +242,16 @@ pub fn notice(text: &str) {
         *n = Some((text.to_string(), Instant::now()));
     }
 }
-/// Подсказка, если ещё не погасла: (текст, видимость 0..=1).
+/// Подсказка, если ещё не погасла: (текст, сколько секунд прошло).
 pub fn current_notice() -> Option<(String, f32)> {
-    const FOR: Duration = Duration::from_millis(1800);
     let n = NOTICE.lock().ok()?;
     let (text, at) = n.as_ref()?;
-    let age = at.elapsed();
-    if age >= FOR {
-        return None;
-    }
-    Some((text.clone(), ((FOR - age).as_secs_f32() / FOR.as_secs_f32() * 3.0).min(1.0)))
+    let age = at.elapsed().as_secs_f32();
+    (age < NOTICE_FOR).then(|| (text.clone(), age))
 }
+
+/// Сколько секунд видна подсказка над хотбаром.
+pub const NOTICE_FOR: f32 = 1.8;
 
 /// Клавиша, назначенная в меню мода для слота рации (None — не назначали, берём из Options > Mods).
 pub fn slot_binding(slot: usize) -> Option<String> {
@@ -324,6 +349,25 @@ pub fn set_voice_volume_pct(v: u32) { VOICE_VOLUME.store(v.min(200), Relaxed) }
 pub fn voice_volume() -> f32 { voice_volume_pct() as f32 / 100.0 }
 pub fn group_volume_pct() -> u32 { GROUP_VOLUME.load(Relaxed) }
 pub fn set_group_volume_pct(v: u32) { GROUP_VOLUME.store(v.min(200), Relaxed) }
+/// На сервере есть группы / звуки мира (аддоны групп и пластинок): только тогда их ползунки видны в меню.
+static HAS_GROUPS: AtomicBool = AtomicBool::new(false);
+static HAS_WORLD: AtomicBool = AtomicBool::new(false);
+pub fn server_has_groups() -> bool { HAS_GROUPS.load(Relaxed) }
+pub fn server_has_world() -> bool { HAS_WORLD.load(Relaxed) }
+pub fn set_server_has_groups(v: bool) { HAS_GROUPS.store(v, Relaxed) }
+pub fn set_server_has_world(v: bool) { HAS_WORLD.store(v, Relaxed) }
+
+/// Что умеет сервер Plasmo, по именам его линий источников: `groups` — аддон групп; `discs`, `music`,
+/// `jukebox`, `radio` — звуки мира (пластинки). Другие линии (например, `vip`) — это голоса игроков. Если звук
+/// мира всё же придёт по незнакомой линии, ползунок появится сам, как только он зазвучит.
+pub fn note_server_lines(lines: &[String]) {
+    set_server_has_groups(lines.iter().any(|l| l == "groups"));
+    const WORLD: [&str; 5] = ["disc", "music", "jukebox", "radio", "sound"];
+    set_server_has_world(lines.iter().any(|l| WORLD.iter().any(|w| l.to_lowercase().contains(w))));
+}
+
+pub fn music_volume_pct() -> u32 { MUSIC_VOLUME.load(Relaxed) }
+pub fn set_music_volume_pct(v: u32) { MUSIC_VOLUME.store(v.min(200), Relaxed) }
 pub fn noise_pct() -> u32 { NOISE_PCT.load(Relaxed) }
 pub fn set_noise_pct(v: u32) { NOISE_PCT.store(v.min(100), Relaxed) }
 /// Сила шумоподавления 0.0..=1.0.
@@ -358,6 +402,8 @@ pub fn set_mic_off(v: bool) {
         MIC_GEN.fetch_add(1, Relaxed); // голосовой поток закроет или откроет запись
     }
 }
+pub fn noise_ai() -> bool { NOISE_AI.load(Relaxed) }
+pub fn set_noise_ai(v: bool) { NOISE_AI.store(v, Relaxed) }
 pub fn hum_filter() -> bool { HUM_FILTER.load(Relaxed) }
 pub fn set_hum_filter(v: bool) { HUM_FILTER.store(v, Relaxed) }
 pub fn agc_on() -> bool { AGC_ON.load(Relaxed) }
@@ -390,6 +436,17 @@ pub fn set_out_list(v: Vec<(String, String)>) {
 pub fn out_stereo() -> bool { OUT_STEREO.load(Relaxed) }
 pub fn set_out_stereo(v: bool) { OUT_STEREO.store(v, Relaxed) }
 pub fn out_ok() -> bool { OUT_OK.load(Relaxed) }
+/// Ваш ник в игре (из сущностей мира: игрок в точке, где стоите вы). Пусто — ещё не узнали.
+static SELF_NAME: Mutex<String> = Mutex::new(String::new());
+pub fn self_name() -> String { SELF_NAME.lock().map(|n| n.clone()).unwrap_or_default() }
+pub fn set_self_name(n: &str) {
+    if let Ok(mut g) = SELF_NAME.lock() {
+        if *g != n {
+            *g = n.to_string();
+        }
+    }
+}
+
 pub fn protocol() -> String { PROTOCOL.lock().map(|p| p.clone()).unwrap_or_default() }
 pub fn set_protocol(v: &str) {
     if let Ok(mut p) = PROTOCOL.lock() {
@@ -446,6 +503,76 @@ pub fn set_out_ok(v: bool) { OUT_OK.store(v, Relaxed) }
 pub fn mic_scroll() -> usize { MIC_SCROLL.load(Relaxed) as usize }
 pub fn set_mic_scroll(v: usize) { MIC_SCROLL.store(v as u32, Relaxed) }
 pub fn nametags_on() -> bool { NAMETAGS_ON.load(Relaxed) }
+pub fn hotbar_icon_on() -> bool { HOTBAR_ICON_ON.load(Relaxed) }
+pub fn set_hotbar_icon_on(v: bool) { HOTBAR_ICON_ON.store(v, Relaxed) }
+pub fn notes_on() -> bool { NOTES_ON.load(Relaxed) }
+pub fn set_notes_on(v: bool) { NOTES_ON.store(v, Relaxed) }
+/// От кого показывать приглашения в группу.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InviteMode {
+    /// От всех, кроме отмеченных (по умолчанию; никто не отмечен — от всех).
+    AllExcept,
+    /// Только от отмеченных.
+    OnlyFrom,
+    /// Ни от кого.
+    Nobody,
+}
+
+pub fn invite_mode() -> InviteMode {
+    match INVITE_MODE.load(Relaxed) {
+        1 => InviteMode::OnlyFrom,
+        2 => InviteMode::Nobody,
+        _ => InviteMode::AllExcept,
+    }
+}
+pub fn set_invite_mode(m: InviteMode) {
+    INVITE_MODE.store(m as u8, Relaxed)
+}
+pub fn invites_on() -> bool { invite_mode() != InviteMode::Nobody }
+
+fn list_of(l: &Mutex<Vec<String>>) -> Vec<String> { l.lock().map(|g| g.clone()).unwrap_or_default() }
+fn list_has(l: &Mutex<Vec<String>>, nick: &str) -> bool {
+    let n = nick.to_lowercase();
+    l.lock().map(|g| g.iter().any(|b| *b == n)).unwrap_or(false)
+}
+fn list_set(l: &Mutex<Vec<String>>, nick: &str, on: bool) {
+    let n = nick.trim().to_lowercase();
+    if n.is_empty() || n.contains(',') {
+        return;
+    }
+    if let Ok(mut g) = l.lock() {
+        g.retain(|b| *b != n);
+        if on {
+            g.push(n);
+        }
+    }
+}
+/// «От всех, кроме»: от кого не показываем.
+pub fn invite_blocked() -> Vec<String> { list_of(&INVITE_BLOCK) }
+pub fn is_invite_blocked(nick: &str) -> bool { list_has(&INVITE_BLOCK, nick) }
+pub fn set_invite_blocked(nick: &str, on: bool) { list_set(&INVITE_BLOCK, nick, on) }
+/// «Только от»: от кого показываем.
+pub fn invite_allowed() -> Vec<String> { list_of(&INVITE_ALLOW) }
+pub fn is_invite_allowed(nick: &str) -> bool { list_has(&INVITE_ALLOW, nick) }
+pub fn set_invite_allowed(nick: &str, on: bool) { list_set(&INVITE_ALLOW, nick, on) }
+
+/// Показать ли приглашение от `from` (None — ник не узнали).
+pub fn invite_accepted(from: Option<&str>) -> bool {
+    match invite_mode() {
+        InviteMode::Nobody => false,
+        InviteMode::AllExcept => !from.is_some_and(is_invite_blocked),
+        InviteMode::OnlyFrom => from.is_some_and(is_invite_allowed),
+    }
+}
+pub fn disc_label_on() -> bool { DISC_LABEL_ON.load(Relaxed) }
+pub fn disc_glow_on() -> bool { DISC_GLOW_ON.load(Relaxed) }
+pub fn set_disc_glow_on(v: bool) { DISC_GLOW_ON.store(v, Relaxed) }
+pub fn disc_focus_on() -> bool { DISC_FOCUS_ON.load(Relaxed) }
+pub fn set_disc_focus_on(v: bool) { DISC_FOCUS_ON.store(v, Relaxed) }
+/// При закреплённой пластинке остальные совсем не слышны (иначе — тихо фоном).
+pub fn pin_solo_on() -> bool { PIN_SOLO_ON.load(Relaxed) }
+pub fn set_pin_solo_on(v: bool) { PIN_SOLO_ON.store(v, Relaxed) }
+pub fn set_disc_label_on(v: bool) { DISC_LABEL_ON.store(v, Relaxed) }
 pub fn set_nametags_on(v: bool) { NAMETAGS_ON.store(v, Relaxed) }
 pub fn overlay_on() -> bool { OVERLAY_ON.load(Relaxed) }
 pub fn set_overlay_on(v: bool) { OVERLAY_ON.store(v, Relaxed) }
@@ -463,6 +590,10 @@ pub fn placing_group() -> bool { PLACING_GROUP.load(Relaxed) }
 pub fn set_placing_group(v: bool) { PLACING_GROUP.store(v, Relaxed) }
 
 pub fn level() -> f32 { f32::from_bits(LEVEL.load(Relaxed)) }
+pub fn vad_ai() -> bool { VAD_AI.load(Relaxed) }
+pub fn set_vad_ai(v: bool) { VAD_AI.store(v, Relaxed) }
+pub fn speech() -> f32 { f32::from_bits(SPEECH.load(Relaxed)) }
+pub fn set_speech(v: f32) { SPEECH.store(v.to_bits(), Relaxed) }
 pub fn set_level(v: f32) { LEVEL.store(v.to_bits(), Relaxed) }
 pub fn speaking() -> bool { SPEAKING.load(Relaxed) }
 pub fn set_speaking(v: bool) { SPEAKING.store(v, Relaxed) }
@@ -713,6 +844,7 @@ pub fn reset_sliders() {
     set_mic_gain_pct(100);
     set_voice_volume_pct(100);
     set_group_volume_pct(100);
+    set_music_volume_pct(100);
     set_noise_pct(0);
 }
 
@@ -769,6 +901,18 @@ pub fn save() {
     }
     text.push_str(&format!("dist_fade={}\n", dist_fade_on()));
     text.push_str(&format!("group_split={}\n", group_split_on()));
+    text.push_str(&format!("music_volume={}\n", music_volume_pct()));
+    text.push_str(&format!("notes={}\n", notes_on()));
+    text.push_str(&format!("hotbar_icon={}\n", hotbar_icon_on()));
+    text.push_str(&format!("noise_ai={}\n", noise_ai()));
+    text.push_str(&format!("vad_ai={}\n", vad_ai()));
+    text.push_str(&format!("disc_label={}\n", disc_label_on()));
+    text.push_str(&format!("disc_glow={}\n", disc_glow_on()));
+    text.push_str(&format!("disc_focus={}\n", disc_focus_on()));
+    text.push_str(&format!("pin_solo={}\n", pin_solo_on()));
+    text.push_str(&format!("invite_mode={}\n", invite_mode() as u8));
+    text.push_str(&format!("invite_allow={}\n", invite_allowed().join(",")));
+    text.push_str(&format!("invite_block={}\n", invite_blocked().join(",")));
     text.push_str(&format!("group_corner={}\n", group_corner()));
     text.push_str(&format!("lang={}\n", crate::i18n::pref_key(crate::i18n::pref())));
     for slot in 0..PTT_SLOTS {
@@ -827,14 +971,39 @@ pub fn load() {
                 "overlay_on" => set_overlay_on(v == "true"),
                 "activation" => set_push_to_talk(v == "ptt"),
                 "nametags" => set_nametags_on(v == "true"),
+                "notes" => set_notes_on(v != "false"),
+                "hotbar_icon" => set_hotbar_icon_on(v != "false"),
+                "disc_label" => set_disc_label_on(v != "false"),
+                "disc_glow" => set_disc_glow_on(v != "false"),
+                "disc_focus" => set_disc_focus_on(v != "false"),
+                "pin_solo" => set_pin_solo_on(v == "true"),
+                "invites" if v == "false" => set_invite_mode(InviteMode::Nobody),
+                "invite_mode" => set_invite_mode(match v {
+                    "1" => InviteMode::OnlyFrom,
+                    "2" => InviteMode::Nobody,
+                    _ => InviteMode::AllExcept,
+                }),
+                "invite_allow" => {
+                    for n in v.split(',') {
+                        set_invite_allowed(n, true);
+                    }
+                }
+                "invite_block" => {
+                    for n in v.split(',') {
+                        set_invite_blocked(n, true);
+                    }
+                }
                 "noise" => {
                     if let Ok(t) = v.parse::<u32>() {
                         set_noise_pct(t)
                     }
                 }
                 "mic_device" => set_mic_device(v),
-                "mic_off" => set_mic_off(v == "true"),
+                // «Отключить устройство» убрано из меню: старое значение не включаем, иначе микрофон не вернуть
+                "mic_off" => set_mic_off(false),
                 "hum_filter" => set_hum_filter(v != "false"),
+                "noise_ai" => set_noise_ai(v != "false"),
+                "vad_ai" => set_vad_ai(v == "true"),
                 "agc" => set_agc_on(v == "true"),
                 "occlusion" => set_occlusion_on(v != "false"),
                 "directional" => set_directional_on(v != "false"),
@@ -855,6 +1024,10 @@ pub fn load() {
                         set_action_binding(action, Some(v));
                     } else if other == "dist_fade" {
                         set_dist_fade_on(v != "false");
+                    } else if other == "music_volume" {
+                        if let Ok(t) = v.parse::<u32>() {
+                            set_music_volume_pct(t);
+                        }
                     } else if other == "group_split" {
                         set_group_split_on(v != "false");
                     } else if other == "group_corner" {
@@ -887,6 +1060,21 @@ pub fn load() {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn server_lines_decide_which_sliders_show() {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        note_server_lines(&names(&["proximity"]));
+        assert!(!server_has_groups() && !server_has_world());
+        note_server_lines(&names(&["proximity", "groups"]));
+        assert!(server_has_groups() && !server_has_world());
+        note_server_lines(&names(&["proximity", "discs"]));
+        assert!(!server_has_groups() && server_has_world());
+        note_server_lines(&names(&["proximity", "vip"]));
+        assert!(!server_has_world(), "vip — голоса, а не музыка");
+        note_server_lines(&[]);
+    }
+
     use super::*;
 
     #[test]

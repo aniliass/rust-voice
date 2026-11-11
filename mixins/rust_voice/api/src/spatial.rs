@@ -45,9 +45,104 @@ struct Entry {
     /// `route` пересчитанный в оси головы (обновляется каждый кадр вместе с поворотом).
     route_rel: [f64; 3],
     route_at: Option<Instant>,
+    /// Звук мира внутри блока (пластинка в проигрывателе): насколько он замурован, 0..=1 — доля закрытых
+    /// соседних клеток (верх и четыре стороны). Глушит звук, даже если он находит путь наружу.
+    enc: f32,
 }
 
+/// Доля закрытых клеток вокруг источника внутри блока: сверху и с четырёх сторон (снизу всегда пол).
+/// `solid(x, y, z)` — клетка не пропускает звук (сплошная или стекло).
+fn enclosure(block: [i32; 3], mut solid: impl FnMut(i32, i32, i32) -> bool) -> f32 {
+    let around = [[0, 1, 0], [1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1]];
+    let shut = around.iter().filter(|d| solid(block[0] + d[0], block[1] + d[1], block[2] + d[2])).count();
+    shut as f32 / around.len() as f32
+}
+
+/// Что за клетка у источника звука мира.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Spot {
+    Jukebox,
+    Solid,
+    Air,
+}
+
+/// Клетка для `source_block` по имени блока игры.
+pub fn spot_of(host: &dyn Host, x: i32, y: i32, z: i32) -> Spot {
+    let name = host.block([x, y, z]).to_string();
+    if name.contains("jukebox") {
+        return Spot::Jukebox;
+    }
+    match host.client_block_obstruction([x, y, z]) {
+        Some((false, _)) => Spot::Air,
+        _ => Spot::Solid,
+    }
+}
+
+/// Блок, в котором стоит источник звука мира (проигрыватель). pv-addon-discs шлёт точку на полтора блока
+/// выше низа проигрывателя (центр клетки над ним), другие аддоны — центр самого блока. Сначала ищем сам
+/// проигрыватель (в точке или под ней); иначе: точка в воздухе посреди клетки над сплошным блоком — это он,
+/// точка внутри сплошного блока — он сам. `None` — звук висит в воздухе (сущность, звук без блока).
+pub fn source_block(pos: [f64; 3], mut spot: impl FnMut(i32, i32, i32) -> Spot) -> Option<[i32; 3]> {
+    let c = [pos[0].floor() as i32, pos[1].floor() as i32, pos[2].floor() as i32];
+    let below = [c[0], c[1] - 1, c[2]];
+    let here = spot(c[0], c[1], c[2]);
+    if here == Spot::Jukebox {
+        return Some(c);
+    }
+    let under = spot(below[0], below[1], below[2]);
+    if under == Spot::Jukebox {
+        return Some(below);
+    }
+    let mid = (pos[1].fract() - 0.5).abs() < 0.01;
+    match (here, under) {
+        (Spot::Air, Spot::Solid) if mid => Some(below),
+        (Spot::Solid, _) => Some(c),
+        _ => None,
+    }
+}
+
+/// Насколько глушит замурованность: даже со щелью сзади звук заметно глуше, полностью закрытый — почти бас.
+const ENCLOSED_OCC: f32 = 0.9;
+
 static MAP: Mutex<Option<HashMap<String, Entry>>> = Mutex::new(None);
+
+/// Где звучит звук мира (не голос игрока): точка или сущность.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum At {
+    Pos([f64; 3]),
+    Entity(u32),
+}
+
+/// Звуки мира, которые сейчас играют: ключ (начинается с `@`) -> где и когда последний раз пришёл звук.
+/// Обрабатываются как игроки: глуше за стенами, огибают углы.
+static EMITTERS: Mutex<Option<HashMap<String, (At, Instant)>>> = Mutex::new(None);
+
+/// Где сейчас звуки мира (ключ, точка): пересчитывается в `update`, читают ноты над пластинкой.
+static EMIT_POS: Mutex<Vec<(String, [f64; 3])>> = Mutex::new(Vec::new());
+
+/// Звуки мира, которые играют, и их точки (для нот над пластинкой).
+pub fn emitter_positions() -> Vec<(String, [f64; 3])> {
+    EMIT_POS.lock().map(|g| g.clone()).unwrap_or_default()
+}
+
+/// Сколько звук мира считается играющим после последнего пакета.
+const EMIT_HOLD: Duration = Duration::from_secs(2);
+
+/// Ключ звука мира для [`params`] (у игроков ключ — ник, у звуков мира — `@` и id источника).
+pub fn emitter_key(src: &[u8; 16]) -> String {
+    let mut k = String::from("@");
+    for b in src {
+        k.push_str(&format!("{b:02x}"));
+    }
+    k
+}
+
+/// Звук мира пришёл: запомнить, где он звучит.
+pub fn emit(key: &str, at: At) {
+    if let Ok(mut g) = EMITTERS.lock() {
+        g.get_or_insert_with(HashMap::new).insert(key.to_string(), (at, Instant::now()));
+    }
+}
 static LAST: Mutex<Option<Instant>> = Mutex::new(None);
 
 pub fn reset() {
@@ -69,12 +164,12 @@ fn read_listener(host: &dyn Host) -> Option<Listener> {
 }
 
 /// ЕДИНСТВЕННОЕ место, зависящее от `Host::client_entities`: (ник, где рот).
-fn read_players(host: &dyn Host) -> Vec<(String, [f64; 3])> {
-    host.client_entities()
-        .into_iter()
+fn read_players(entities: &[horizon_client::mod_api::NativeClientEntity]) -> Vec<(String, [f64; 3])> {
+    entities
+        .iter()
         .filter(|e| e.alive)
         .filter_map(|e| {
-            let name = e.player_name?;
+            let name = e.player_name.clone()?;
             let p = e.position;
             Some((name, [p[0], p[1] + e.height as f64 * MOUTH, p[2]]))
         })
@@ -114,7 +209,33 @@ pub fn update(host: &dyn Host) {
         *last = Some(now);
     }
     let Some(me) = read_listener(host) else { return };
-    let players = read_players(host);
+    let entities = host.client_entities();
+    let mut players = read_players(&entities);
+    // звуки мира (пластинки, мобы): их точка или сущность, если она ещё рядом
+    let mut emit_pos = Vec::new();
+    if let Ok(mut g) = EMITTERS.lock() {
+        let em = g.get_or_insert_with(HashMap::new);
+        em.retain(|_, (_, at)| now.duration_since(*at) < EMIT_HOLD * 4);
+        for (k, (at, t)) in em.iter() {
+            if now.duration_since(*t) >= EMIT_HOLD {
+                continue;
+            }
+            let pos = match *at {
+                At::Pos(p) => Some(p),
+                At::Entity(id) => entities.iter().find(|e| e.id == id && e.alive).map(|e| {
+                    let p = e.position;
+                    [p[0], p[1] + e.height as f64 * 0.5, p[2]]
+                }),
+            };
+            if let Some(p) = pos {
+                players.push((k.clone(), p));
+                emit_pos.push((k.clone(), p));
+            }
+        }
+    }
+    if let Ok(mut g) = EMIT_POS.lock() {
+        *g = emit_pos;
+    }
     let occlusion = crate::settings::occlusion_on();
     let routes = occlusion && crate::settings::routes_on();
     // путь голоса не длиннее полутора дистанции сервера: дальше его всё равно не слышно
@@ -133,6 +254,7 @@ pub fn update(host: &dyn Host) {
             route: None,
             route_rel: rel,
             route_at: None,
+            enc: 0.0,
         });
         e.rel = rel;
         e.at = now;
@@ -144,13 +266,36 @@ pub fn update(host: &dyn Host) {
         }
         if e.occ_at.is_none_or(|t| now.duration_since(t) >= OCC_EVERY) {
             e.occ_at = Some(now);
-            // три луча: в рот, в грудь и чуть в сторону. Сколько закрыто — настолько и глуше.
-            let targets = [mouth, [mouth[0], mouth[1] - 0.6, mouth[2]], [mouth[0] + 0.35, mouth[1], mouth[2] + 0.35]];
-            let shut = targets.iter().filter(|t| !host.client_visual_clear(me.eye, **t)).count();
-            e.occ = shut as f32 / targets.len() as f32;
+            let block = if nick.starts_with('@') {
+                source_block(mouth, |x, y, z| spot_of(host, x, y, z))
+            } else {
+                None
+            };
+            if let Some(cell) = block {
+                // звук мира в сплошном блоке (проигрыватель): лучи к его граням — верх и четыре стороны.
+                // Грань за самим проигрывателем закрыта всегда, поэтому одну закрытую не считаем.
+                e.enc = enclosure(cell, |x, y, z| cell_at(host, x, y, z) != Cell::Air);
+                let c = [cell[0] as f64 + 0.5, cell[1] as f64 + 0.5, cell[2] as f64 + 0.5];
+                let faces = [
+                    [c[0], c[1] + 0.62, c[2]],
+                    [c[0] + 0.62, c[1], c[2]],
+                    [c[0] - 0.62, c[1], c[2]],
+                    [c[0], c[1], c[2] + 0.62],
+                    [c[0], c[1], c[2] - 0.62],
+                ];
+                let shut = faces.iter().filter(|t| !host.client_visual_clear(me.eye, **t)).count();
+                e.occ = shut.saturating_sub(1) as f32 / (faces.len() - 1) as f32;
+            } else {
+                e.enc = 0.0;
+                // три луча: в рот, в грудь и чуть в сторону. Сколько закрыто — настолько и глуше.
+                let targets = [mouth, [mouth[0], mouth[1] - 0.6, mouth[2]], [mouth[0] + 0.35, mouth[1], mouth[2] + 0.35]];
+                let shut = targets.iter().filter(|t| !host.client_visual_clear(me.eye, **t)).count();
+                e.occ = shut as f32 / targets.len() as f32;
+            }
         }
         // обход препятствия: только если игрок за стеной и сейчас говорит (молчащих не слышно — незачем)
-        if !routes || e.occ < ROUTE_OCC || !crate::roster::is_talking(&nick) {
+        let sounding = nick.starts_with('@') || crate::roster::is_talking(&nick);
+        if !routes || e.occ < ROUTE_OCC || !sounding {
             e.route = None;
             e.route_at = None;
         } else {
@@ -181,10 +326,13 @@ pub fn params(nick: &str, max_dist: f32) -> Option<Params> {
         return None;
     }
     let direct = from_rel(e.rel, e.occ, max_dist);
-    Some(match e.route {
+    let mut p = match e.route {
         Some(r) => choose(direct, e.rel, e.route_rel, r, max_dist),
         None => direct,
-    })
+    };
+    // замурованный проигрыватель глушит всегда: звук выходит наружу уже приглушённым
+    p.occ = p.occ.max(e.enc * ENCLOSED_OCC);
+    Some(p)
 }
 
 /// Сквозь стену или в обход: звук идёт обоими путями, слышим тот, что громче.
@@ -212,7 +360,9 @@ fn from_rel_len(rel: [f64; 3], dist: f32, occ: f32, max_dist: f32) -> Params {
     let fade = crate::settings::dist_fade_on();
     let gain = if fade { dsp::distance_gain(dist, max_dist) } else { 1.0 };
     let far = if fade && max_dist > 0.0 { (dist / max_dist).clamp(0.0, 1.0) } else { 0.0 };
-    Params { gain, side: side * near, front: lerp1(front, near), occ, far }
+    let len = (rel[0] * rel[0] + rel[1] * rel[1] + rel[2] * rel[2]).sqrt();
+    let up = if len > 0.3 { (rel[1] / len) as f32 } else { 0.0 };
+    Params { gain, side: side * near, front: lerp1(front, near), occ, far, up }
 }
 
 fn lerp1(front: f32, t: f32) -> f32 {
@@ -263,5 +413,15 @@ mod tests {
         // слишком длинный обход проигрывает стене
         let far = acoustics::Route { apparent: [0.0; 3], length: 30.0, thin: 0 };
         assert_eq!(choose(direct, rel, [4.0, 0.0, 3.0], far, 32.0), direct);
+    }
+
+    #[test]
+    fn enclosed_jukebox_is_counted_by_its_neighbours() {
+        let open = enclosure([0, 64, 0], |_, _, _| false);
+        assert_eq!(open, 0.0);
+        // крышка и три стороны, сзади щель
+        let boxed = enclosure([0, 64, 0], |x, y, z| (x, y, z) != (0, 64, -1));
+        assert!((boxed - 0.8).abs() < 1e-6);
+        assert!(boxed * ENCLOSED_OCC > 0.7, "со щелью всё равно глухо");
     }
 }

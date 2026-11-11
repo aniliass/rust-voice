@@ -12,6 +12,17 @@
 //!    Клиент раз в секунду шлёт Authenticate, пока не придёт AuthenticateAck (с nonce), потом
 //!    ConnectionCheck(nonce), пока не придёт ConnectionCheckAck. Дальше сервер шлёт KeepAlive — отвечаем тем же.
 //!
+//! Версии протокола (у SVC это «версия совместимости»):
+//! - **20** — SVC 2.6.x (плагины на Paper/Fabric) и родной сервер голоса Horizon (`voicechat-server`).
+//!   В ключе нет id соединения: UDP подписывается UUID игрока. Authenticate несёт UUID и ключ, ответ — пустой,
+//!   ConnectionCheck — пустой. Состояние игрока — два флага (выключен, не подключён), UUID, ник, группа.
+//!   Своё состояние клиент шлёт в `voicechat:update_state` (только «выключен»).
+//! - **21** — SVC 2.7: в ключе есть id соединения, AuthenticateAck несёт nonce, состояния — байт флагов.
+//! Сервер отдаёт ключ только клиенту своей версии, поэтому мы спрашиваем обеими (см. `request_version`).
+//!
+//! Сервер Horizon передаёт те же сообщения не по каналам `voicechat:*`, а внутри своего канала
+//! `horizon:mod_net` (имя канала + байты): см. `mod_net_wrap` / `mod_net_unwrap`.
+//!
 //! Здесь нет API игры: всё проверяется обычными тестами.
 
 use aes::cipher::{BlockEncrypt, KeyInit};
@@ -22,10 +33,46 @@ pub const CH_STATES: &str = "voicechat:states";
 pub const CH_STATE: &str = "voicechat:state";
 pub const CH_REMOVE_STATE: &str = "voicechat:remove_state";
 pub const CH_CLIENT_STATE: &str = "voicechat:client_state";
+/// Своё состояние в версии 20 (SVC 2.6, сервер Horizon): выключен ли голосовой чат.
+pub const CH_UPDATE_STATE: &str = "voicechat:update_state";
+/// Группы. Клиент: создать, войти (с паролем), выйти. Сервер: появилась группа, исчезла, вы вошли или вышли.
+pub const CH_CREATE_GROUP: &str = "voicechat:create_group";
+pub const CH_SET_GROUP: &str = "voicechat:set_group";
+pub const CH_LEAVE_GROUP: &str = "voicechat:leave_group";
+pub const CH_ADD_GROUP: &str = "voicechat:add_group";
+pub const CH_REMOVE_GROUP: &str = "voicechat:remove_group";
+pub const CH_JOINED_GROUP: &str = "voicechat:joined_group";
 /// Каналы, о которых клиент сообщает серверу (`minecraft:register`): без этого Paper не шлёт по ним пакеты.
-pub const CHANNELS: [&str; 6] = [CH_REQUEST_SECRET, CH_SECRET, CH_STATES, CH_STATE, CH_REMOVE_STATE, CH_CLIENT_STATE];
-/// Версия совместимости SVC для Minecraft 26.x: сервер отдаёт ключ только клиенту с той же версией.
-pub const COMPATIBILITY_VERSION: i32 = 21;
+pub const CHANNELS: [&str; 13] = [
+    CH_REQUEST_SECRET,
+    CH_SECRET,
+    CH_STATES,
+    CH_STATE,
+    CH_REMOVE_STATE,
+    CH_CLIENT_STATE,
+    CH_UPDATE_STATE,
+    CH_CREATE_GROUP,
+    CH_SET_GROUP,
+    CH_LEAVE_GROUP,
+    CH_ADD_GROUP,
+    CH_REMOVE_GROUP,
+    CH_JOINED_GROUP,
+];
+/// Длина названия и пароля группы (как у сервера SVC).
+pub const GROUP_TEXT_MAX: usize = 32;
+/// SVC 2.6.x и сервер голоса Horizon.
+pub const V26: i32 = 20;
+/// SVC 2.7.
+pub const V27: i32 = 21;
+/// Канал Horizon для сообщений модов (сервер голоса Horizon шлёт по нему всё то же, что SVC по `voicechat:*`).
+pub const MOD_NET: &str = "horizon:mod_net";
+
+/// С какой версией просить ключ на попытке `n` (с 1): по две попытки 2.6, потом по две 2.7 и так далее.
+/// Сервер SVC отвечает только своей версии (на чужую, бывает, пишет игроку в чат), так что сначала самая
+/// частая: 2.6 стоит на большинстве серверов и на всех серверах Horizon.
+pub fn request_version(n: u32) -> i32 {
+    if (n.max(1) - 1) / 2 % 2 == 0 { V26 } else { V27 }
+}
 
 const MAGIC: u8 = 0xFF;
 
@@ -41,6 +88,125 @@ fn varint(out: &mut Vec<u8>, mut v: u32) {
         }
         out.push(b | 0x80);
     }
+}
+
+/// Тип группы SVC: обычная (участники слышат друг друга везде и тех, кто рядом), открытая (рядом стоящие
+/// слышат группу и их слышат), изолированная (слышат только друг друга).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupKind {
+    Normal,
+    Open,
+    Isolated,
+}
+
+impl GroupKind {
+    fn wire(self) -> i16 {
+        match self {
+            GroupKind::Normal => 0,
+            GroupKind::Open => 1,
+            GroupKind::Isolated => 2,
+        }
+    }
+    fn from_wire(v: i16) -> Self {
+        match v {
+            1 => GroupKind::Open,
+            2 => GroupKind::Isolated,
+            _ => GroupKind::Normal,
+        }
+    }
+}
+
+/// Группа от сервера (`voicechat:add_group`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SvcGroup {
+    pub id: [u8; 16],
+    pub name: String,
+    pub has_password: bool,
+    pub persistent: bool,
+    pub hidden: bool,
+    pub kind: GroupKind,
+}
+
+fn put_text(out: &mut Vec<u8>, s: &str) {
+    varint(out, s.len() as u32);
+    out.extend_from_slice(s.as_bytes());
+}
+
+/// Текст для группы: без управляющих символов, не длиннее `GROUP_TEXT_MAX` символов.
+fn group_text(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).take(GROUP_TEXT_MAX).collect::<String>().trim().to_string()
+}
+
+/// `voicechat:create_group`: название, пароль (если есть), тип.
+pub fn create_group(name: &str, password: Option<&str>, kind: GroupKind) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_text(&mut out, &group_text(name));
+    match password.map(group_text).filter(|p| !p.is_empty()) {
+        Some(p) => {
+            out.push(1);
+            put_text(&mut out, &p);
+        }
+        None => out.push(0),
+    }
+    out.extend_from_slice(&kind.wire().to_be_bytes());
+    out
+}
+
+/// `voicechat:set_group`: войти в группу (с паролем, если он нужен).
+pub fn set_group(id: &[u8; 16], password: Option<&str>) -> Vec<u8> {
+    let mut out = id.to_vec();
+    match password.map(group_text).filter(|p| !p.is_empty()) {
+        Some(p) => {
+            out.push(1);
+            put_text(&mut out, &p);
+        }
+        None => out.push(0),
+    }
+    out
+}
+
+/// `voicechat:add_group`.
+pub fn parse_add_group(data: &[u8]) -> Option<SvcGroup> {
+    let mut b = Buf::new(data);
+    let g = SvcGroup {
+        id: b.uuid()?,
+        name: b.utf(512)?,
+        has_password: b.bool()?,
+        persistent: b.bool()?,
+        hidden: b.bool()?,
+        kind: GroupKind::from_wire(b.i16()?),
+    };
+    Some(g)
+}
+
+/// `voicechat:remove_group`.
+pub fn parse_remove_group(data: &[u8]) -> Option<[u8; 16]> {
+    Buf::new(data).uuid()
+}
+
+/// `voicechat:joined_group`: в какой группе вы теперь (None — ни в какой) и не был ли пароль неверным.
+pub fn parse_joined_group(data: &[u8]) -> Option<(Option<[u8; 16]>, bool)> {
+    let mut b = Buf::new(data);
+    let group = if b.bool()? { Some(b.uuid()?) } else { None };
+    Some((group, b.bool()?))
+}
+
+/// Сообщение для `horizon:mod_net`: имя канала (строка) и байты (VarInt-длина + данные).
+pub fn mod_net_wrap(channel: &str, data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(channel.len() + data.len() + 6);
+    varint(&mut out, channel.len() as u32);
+    out.extend_from_slice(channel.as_bytes());
+    varint(&mut out, data.len() as u32);
+    out.extend_from_slice(data);
+    out
+}
+
+/// Разобрать `horizon:mod_net`: (канал, байты). Лишние байты в конце — не наш формат.
+pub fn mod_net_unwrap(payload: &[u8]) -> Option<(String, Vec<u8>)> {
+    let mut b = Buf::new(payload);
+    let channel = b.utf(129)?;
+    let data = b.bytes(30_000)?.to_vec();
+    (b.pos == payload.len()).then_some((channel, data))
 }
 
 /// Читатель FriendlyByteBuf: big-endian числа, VarInt-длины, UUID как два long.
@@ -63,6 +229,9 @@ impl<'a> Buf<'a> {
     }
     fn bool(&mut self) -> Option<bool> {
         Some(self.u8()? != 0)
+    }
+    fn i16(&mut self) -> Option<i16> {
+        Some(i16::from_be_bytes(self.take(2)?.try_into().ok()?))
     }
     fn i32(&mut self) -> Option<i32> {
         Some(i32::from_be_bytes(self.take(4)?.try_into().ok()?))
@@ -201,15 +370,23 @@ pub fn request_secret(version: i32) -> Vec<u8> {
     version.to_be_bytes().to_vec()
 }
 
-/// `voicechat:client_state`: выключен ли у вас микрофон и голосовой чат.
+/// `voicechat:client_state` (2.7): выключен ли у вас микрофон и голосовой чат.
 pub fn client_state(muted: bool, disabled: bool) -> Vec<u8> {
     vec![muted as u8, disabled as u8]
+}
+
+/// Своё состояние для сервера: канал и байты своей версии. В 2.6 микрофон серверу не сообщается.
+pub fn own_state(version: i32, muted: bool, disabled: bool) -> (&'static str, Vec<u8>) {
+    if version == V26 { (CH_UPDATE_STATE, vec![disabled as u8]) } else { (CH_CLIENT_STATE, client_state(muted, disabled)) }
 }
 
 /// Что сервер прислал в `voicechat:secret`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Secret {
+    /// Версия протокола, в которой пришёл ключ (`V26` или `V27`).
+    pub version: i32,
     pub key: [u8; 16],
+    /// Чем подписан UDP: id соединения (2.7) или UUID игрока (2.6).
     pub connection_id: [u8; 16],
     pub port: i32,
     pub player: [u8; 16],
@@ -224,20 +401,68 @@ pub struct Secret {
     pub voice_host: String,
 }
 
-pub fn parse_secret(data: &[u8]) -> Option<Secret> {
+/// Ключ в раскладке версии `version`. `None`, если не сходится (в том числе лишние или недостающие байты).
+pub fn parse_secret_as(data: &[u8], version: i32) -> Option<Secret> {
+    parse_secret_with(data, version, true)
+}
+
+/// `strict` — ключ должен кончаться ровно там, где кончаются известные поля. Без него хвост
+/// (новые поля других сборок SVC) пропускается, а версию выдают правдоподобные значения полей.
+fn parse_secret_with(data: &[u8], version: i32, strict: bool) -> Option<Secret> {
     let mut b = Buf::new(data);
+    let key = b.uuid()?;
+    let conn = if version == V26 { None } else { Some(b.uuid()?) };
+    let port = b.i32()?;
+    let player = b.uuid()?;
+    let codec = b.u8()?;
+    let mtu = b.i32()?;
+    let distance = b.f64()?;
+    let keep_alive = b.i32()?;
+    let groups = b.bool()?;
+    let voice_host = b.utf(32767)?;
+    let _recording = b.bool(); // «можно записывать»: есть не у всех сборок
+    let sane = (0..=65535).contains(&port) && codec <= 2 && distance.is_finite() && distance >= 0.0 && mtu > 0;
+    let plausible = (64..=65535).contains(&mtu) && distance <= 100_000.0 && (0..=3_600_000).contains(&keep_alive);
+    if !sane || (strict && b.pos != data.len()) || (!strict && !plausible) {
+        return None;
+    }
     Some(Secret {
-        key: b.uuid()?,
-        connection_id: b.uuid()?,
-        port: b.i32()?,
-        player: b.uuid()?,
-        codec: b.u8()?,
-        mtu: b.i32()?,
-        distance: b.f64()?,
-        keep_alive: b.i32()?,
-        groups: b.bool()?,
-        voice_host: b.utf(32767)?,
+        version,
+        key,
+        connection_id: conn.unwrap_or(player),
+        port,
+        player,
+        codec,
+        mtu,
+        distance,
+        keep_alive,
+        groups,
+        voice_host,
     })
+}
+
+/// Ключ любой из версий: раскладки отличаются на 16 байт, и подходит ровно одна.
+pub fn parse_secret(data: &[u8]) -> Option<Secret> {
+    parse_secret_as(data, V26)
+        .or_else(|| parse_secret_as(data, V27))
+        .or_else(|| parse_secret_with(data, V26, false))
+        .or_else(|| parse_secret_with(data, V27, false))
+}
+
+/// Ключ сервера Horizon (всегда 2.6), с тем же допуском на лишний хвост.
+pub fn parse_secret_v26(data: &[u8]) -> Option<Secret> {
+    parse_secret_as(data, V26).or_else(|| parse_secret_with(data, V26, false))
+}
+
+/// Сервер SVC ответил в чат «несовместимая версия» (ключ перевода или английский текст).
+pub fn is_incompatible_notice(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    m.contains("voicechat.incompatible_version") || (m.contains("voice chat") && m.contains("incompatible"))
+}
+
+/// Другая из двух версий протокола.
+pub fn other_version(v: i32) -> i32 {
+    if v == V26 { V27 } else { V26 }
 }
 
 /// Куда слать UDP: (хост, порт). `server` — адрес игрового сервера, как игрок его ввёл (`хост` или `хост:порт`).
@@ -260,7 +485,8 @@ pub fn voice_address(s: &Secret, server: &str) -> (String, u16) {
     }
 }
 
-fn strip_port(addr: &str) -> String {
+/// Хост без порта: `хост:порт`, `[v6]:порт` или просто хост.
+pub fn strip_port(addr: &str) -> String {
     let a = addr.trim();
     if let Some(rest) = a.strip_prefix('[') {
         return rest.split(']').next().unwrap_or(rest).to_string();
@@ -283,7 +509,16 @@ pub struct PlayerState {
     pub group: Option<[u8; 16]>,
 }
 
-fn read_state(b: &mut Buf) -> Option<PlayerState> {
+fn read_state(b: &mut Buf, version: i32) -> Option<PlayerState> {
+    if version == V26 {
+        // 2.6: «выключен», «не подключён», UUID, ник, есть ли группа и её UUID
+        let disabled = b.bool()?;
+        let disconnected = b.bool()?;
+        let uuid = b.uuid()?;
+        let name = b.utf(256)?;
+        let group = if b.bool()? { Some(b.uuid()?) } else { None };
+        return Some(PlayerState { uuid, name, muted: false, disabled, disconnected, group });
+    }
     let flags = b.u8()?;
     let bit = |i: u8| flags & (1 << i) != 0;
     let uuid = b.uuid()?;
@@ -293,18 +528,18 @@ fn read_state(b: &mut Buf) -> Option<PlayerState> {
 }
 
 /// `voicechat:states`: все игроки.
-pub fn parse_states(data: &[u8]) -> Option<Vec<PlayerState>> {
+pub fn parse_states(data: &[u8], version: i32) -> Option<Vec<PlayerState>> {
     let mut b = Buf::new(data);
     let n = b.i32()?;
     if !(0..=10_000).contains(&n) {
         return None;
     }
-    (0..n).map(|_| read_state(&mut b)).collect()
+    (0..n).map(|_| read_state(&mut b, version)).collect()
 }
 
 /// `voicechat:state`: один игрок.
-pub fn parse_state(data: &[u8]) -> Option<PlayerState> {
-    read_state(&mut Buf::new(data))
+pub fn parse_state(data: &[u8], version: i32) -> Option<PlayerState> {
+    read_state(&mut Buf::new(data), version)
 }
 
 /// `voicechat:remove_state`: UUID игрока, который ушёл.
@@ -329,11 +564,34 @@ pub const T_CONNECTION_CHECK_ACK: u8 = 0xA;
 pub struct Session {
     gcm: Gcm,
     pub connection_id: [u8; 16],
+    /// Версия протокола (`V26` или `V27`): от неё зависят тела рукопожатия.
+    pub version: i32,
+    key: [u8; 16],
 }
 
 impl Session {
+    /// Сессия 2.7 (id соединения из ключа).
     pub fn new(key: &[u8; 16], connection_id: [u8; 16]) -> Session {
-        Session { gcm: Gcm::new(key), connection_id }
+        Session::with_version(key, connection_id, V27)
+    }
+
+    pub fn with_version(key: &[u8; 16], connection_id: [u8; 16], version: i32) -> Session {
+        Session { gcm: Gcm::new(key), connection_id, version, key: *key }
+    }
+
+    /// Сессия по ключу из `voicechat:secret` (версия и подпись UDP — оттуда же).
+    pub fn from_secret(s: &Secret) -> Session {
+        Session::with_version(&s.key, s.connection_id, s.version)
+    }
+
+    /// Тело Authenticate: в 2.6 — UUID игрока и ключ, в 2.7 — пусто (всё уже в заголовке).
+    pub fn authenticate_body(&self) -> Vec<u8> {
+        if self.version == V26 { [self.connection_id, self.key].concat() } else { Vec::new() }
+    }
+
+    /// AuthenticateAck: что потом вернуть в ConnectionCheck. В 2.6 ответ пустой, и проверка — тоже.
+    pub fn auth_ack(&self, body: &[u8]) -> Option<Vec<u8>> {
+        if self.version == V26 { Some(Vec::new()) } else { parse_auth_ack(body).map(|n| connection_check(&n)) }
     }
 
     /// Готовый датаграмм клиента: магия, id соединения, длина и зашифрованное (тип + тело).
@@ -525,6 +783,8 @@ mod tests {
         varint(&mut d, 0);
         d.push(0); // allowRecording
         let s = parse_secret(&d).unwrap();
+        assert_eq!(s.version, V27, "раскладка 2.7: с id соединения");
+        assert_eq!(s.connection_id, [2u8; 16]);
         assert_eq!((s.port, s.mtu, s.distance, s.keep_alive, s.groups), (24454, 1024, 48.0, 1000, true));
         assert_eq!(voice_address(&s, "mc.jelecraft.su"), ("mc.jelecraft.su".to_string(), 24454));
         assert_eq!(voice_address(&s, "mc.example.org:25570"), ("mc.example.org".to_string(), 24454));
@@ -543,11 +803,106 @@ mod tests {
         varint(&mut st, 4);
         st.extend_from_slice(b"Alex");
         st.extend_from_slice(&[6u8; 16]);
-        let list = parse_states(&st).unwrap();
+        let list = parse_states(&st, V27).unwrap();
         assert_eq!(list[0].name, "Steve");
         assert!(list[0].muted && !list[0].disabled);
         assert!(list[1].disabled && list[1].group == Some([6u8; 16]));
         assert_eq!(parse_remove_state(&[4u8; 16]), Some([4u8; 16]));
         assert_eq!(request_secret(21), [0, 0, 0, 21]);
+    }
+
+    /// Раскладки 2.6 (и сервера Horizon): ключ без id соединения, состояния флагами-байтами.
+    #[test]
+    fn secret_with_unknown_tail_and_groups_packets() {
+        let mut d = Vec::new();
+        d.extend_from_slice(&[1u8; 16]);
+        d.extend_from_slice(&24454i32.to_be_bytes());
+        d.extend_from_slice(&[3u8; 16]);
+        d.push(0);
+        d.extend_from_slice(&1024i32.to_be_bytes());
+        d.extend_from_slice(&48.0f64.to_be_bytes());
+        d.extend_from_slice(&1000i32.to_be_bytes());
+        d.push(1);
+        varint(&mut d, 0);
+        d.extend_from_slice(&[0, 1, 0, 0, 7]); // запись и поля, которых мы не знаем
+        let s = parse_secret(&d).unwrap();
+        assert_eq!((s.version, s.port, s.player, s.mtu), (V26, 24454, [3u8; 16], 1024));
+        assert!(is_incompatible_notice("message.voicechat.incompatible_version"));
+        assert!(!is_incompatible_notice("Steve joined the game"));
+
+        // группы: что шлём сервер разберёт так же, как мы его ответы
+        let c = create_group("Тест", Some("pw"), GroupKind::Open);
+        let mut b = Buf::new(&c);
+        assert_eq!(b.utf(GROUP_TEXT_MAX).as_deref(), Some("Тест"));
+        assert_eq!(b.bool(), Some(true));
+        assert_eq!(b.utf(GROUP_TEXT_MAX).as_deref(), Some("pw"));
+        assert_eq!(b.i16(), Some(1));
+        let mut a = vec![9u8; 16];
+        varint(&mut a, 4);
+        a.extend_from_slice(b"Team");
+        a.extend_from_slice(&[1, 0, 0]);
+        a.extend_from_slice(&2i16.to_be_bytes());
+        let g = parse_add_group(&a).unwrap();
+        assert_eq!((g.id, g.name.as_str(), g.has_password, g.kind), ([9u8; 16], "Team", true, GroupKind::Isolated));
+        let mut j = vec![1u8];
+        j.extend_from_slice(&[9u8; 16]);
+        j.push(0);
+        assert_eq!(parse_joined_group(&j), Some((Some([9u8; 16]), false)));
+        assert_eq!(parse_joined_group(&[0, 1]), Some((None, true)));
+    }
+
+    #[test]
+    fn v26_secret_states_and_handshake() {
+        let mut d = Vec::new();
+        d.extend_from_slice(&[1u8; 16]); // ключ
+        d.extend_from_slice(&24454i32.to_be_bytes());
+        d.extend_from_slice(&[3u8; 16]); // игрок
+        d.push(0);
+        d.extend_from_slice(&1024i32.to_be_bytes());
+        d.extend_from_slice(&48.0f64.to_be_bytes());
+        d.extend_from_slice(&1000i32.to_be_bytes());
+        d.push(1);
+        varint(&mut d, 0);
+        d.push(0); // запись нельзя
+        let s = parse_secret(&d).unwrap();
+        assert_eq!(s.version, V26);
+        assert_eq!((s.port, s.player, s.connection_id, s.groups), (24454, [3u8; 16], [3u8; 16], true));
+        assert!(parse_secret_as(&d, V27).is_none(), "в 2.7 раскладка другая");
+
+        let sess = Session::from_secret(&s);
+        assert_eq!(sess.authenticate_body(), [[3u8; 16], [1u8; 16]].concat());
+        assert_eq!(sess.auth_ack(&[]), Some(Vec::new()), "в 2.6 ответ пустой, проверка тоже");
+        let dg = sess.wrap(T_AUTHENTICATE, &sess.authenticate_body());
+        assert_eq!(&dg[1..17], &[3u8; 16], "UDP подписан UUID игрока");
+
+        let mut st = 1i32.to_be_bytes().to_vec();
+        st.extend_from_slice(&[1, 0]); // выключен, подключён
+        st.extend_from_slice(&[4u8; 16]);
+        varint(&mut st, 5);
+        st.extend_from_slice(b"Steve");
+        st.push(1);
+        st.extend_from_slice(&[6u8; 16]);
+        let list = parse_states(&st, V26).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "Steve");
+        assert!(list[0].disabled && !list[0].disconnected && !list[0].muted);
+        assert_eq!(list[0].group, Some([6u8; 16]));
+
+        assert_eq!(own_state(V26, true, false), (CH_UPDATE_STATE, vec![0]));
+        assert_eq!(own_state(V27, true, false), (CH_CLIENT_STATE, vec![1, 0]));
+    }
+
+    #[test]
+    fn versions_alternate_by_pairs_starting_with_26() {
+        let v: Vec<i32> = (1..=6).map(request_version).collect();
+        assert_eq!(v, [V26, V26, V27, V27, V26, V26]);
+    }
+
+    #[test]
+    fn mod_net_round_trips() {
+        let m = mod_net_wrap(CH_REQUEST_SECRET, &request_secret(V26));
+        assert_eq!(m[0] as usize, CH_REQUEST_SECRET.len());
+        assert_eq!(mod_net_unwrap(&m), Some((CH_REQUEST_SECRET.to_string(), vec![0, 0, 0, 20])));
+        assert_eq!(mod_net_unwrap(&[&m[..], &[0]].concat()), None, "лишний байт");
     }
 }

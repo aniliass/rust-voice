@@ -72,6 +72,12 @@ fn write_utf(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(s.as_bytes());
 }
 
+/// PlayerStatePacket (тип 11): клиент сообщает серверу, выключены ли у него звук и микрофон;
+/// сервер рассылает это другим (PlayerInfoUpdate), и у них над ником появляется значок.
+pub fn player_state_packet(voice_disabled: bool, microphone_muted: bool) -> Vec<u8> {
+    vec![11, voice_disabled as u8, microphone_muted as u8]
+}
+
 /// PlayerInfoPacket: тип, два флага, версия Minecraft, версия мода, публичный ключ.
 pub fn player_info_packet(public_key_der: &[u8], voice_disabled: bool, microphone_muted: bool) -> Vec<u8> {
     let mut out = vec![TCP_PLAYER_INFO, voice_disabled as u8, microphone_muted as u8];
@@ -124,6 +130,15 @@ pub struct ConnectionInfo {
 }
 
 /// Разбор ConnectionPacket (после байта типа): UUID (16 байт), UTF ip, int port.
+/// Куда слать UDP Plasmo. Сервер присылает адрес из своего конфига; если там «слушать все адреса»
+/// (`0.0.0.0`, `::`) или пусто, это не адрес для клиента — тогда, как настоящий клиент Plasmo, берём адрес
+/// игрового сервера, на который зашли (`server` — как его ввёл игрок, можно с портом).
+pub fn udp_host(ip: &str, server: &str) -> String {
+    let ip = ip.trim();
+    let any = ip.is_empty() || matches!(ip.trim_matches(['[', ']']), "0.0.0.0" | "::" | "0:0:0:0:0:0:0:0");
+    if any { crate::svc::strip_port(server) } else { ip.to_string() }
+}
+
 pub fn parse_connection(body: &[u8]) -> Option<ConnectionInfo> {
     let secret = body.get(0..16)?;
     let len = u16::from_be_bytes([*body.get(16)?, *body.get(17)?]) as usize;
@@ -170,9 +185,12 @@ impl<'a> Reader<'a> {
         self.bytes(n)?;
         Some(())
     }
+    pub fn f64(&mut self) -> Option<f64> {
+        Some(f64::from_be_bytes(self.bytes(8)?.try_into().ok()?))
+    }
     pub fn utf(&mut self) -> Option<String> {
         let n = u16::from_be_bytes(self.bytes(2)?.try_into().ok()?) as usize;
-        String::from_utf8(self.bytes(n)?.to_vec()).ok()
+        Some(java_utf(self.bytes(n)?))
     }
 }
 
@@ -192,6 +210,8 @@ pub struct Config {
     pub activations: Vec<Activation>,
     /// `ok` или шаг, на котором разбор линий/активаций остановился (для лога).
     pub activations_note: &'static str,
+    /// Имена линий источников сервера (`proximity`, `groups`, `discs`…): по ним видно, какие аддоны стоят.
+    pub line_names: Vec<String>,
 }
 
 /// ConfigPacket (после байта типа): serverId, CaptureInfo, EncryptionInfo. Остальное нам не нужно.
@@ -234,6 +254,7 @@ pub fn parse_config(body: &[u8]) -> Option<Config> {
         activation_names: acts.list.iter().map(|a| a.name.clone()).collect(),
         activations: acts.list,
         activations_note: acts.note,
+        line_names: acts.lines,
     })
 }
 
@@ -251,6 +272,7 @@ fn skip_codec_info(r: &mut Reader) -> Option<()> {
 }
 
 struct Activations {
+    lines: Vec<String>,
     list: Vec<Activation>,
     proximity_distance: Option<i32>,
     note: &'static str,
@@ -277,12 +299,51 @@ pub struct Activation {
     pub weight: i32,
 }
 
+/// Дистанции, из которых можно выбрать. `[-1, max]` хранится диапазоном, а не списком: `max` присылает
+/// сервер, и при `max = 2^31 - 1` список занял бы ~8 ГБ памяти.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DistanceChoices {
+    /// Любая от 1 до `max` включительно (`max` >= 1).
+    Range(i32),
+    /// Ровно эти значения (только положительные).
+    List(Vec<i32>),
+}
+
+impl DistanceChoices {
+    pub fn len(&self) -> usize {
+        match self {
+            DistanceChoices::Range(max) => *max as usize,
+            DistanceChoices::List(l) => l.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Дистанция под номером `i` (с нуля).
+    pub fn get(&self, i: usize) -> Option<i32> {
+        match self {
+            DistanceChoices::Range(max) => (i < *max as usize).then(|| i as i32 + 1),
+            DistanceChoices::List(l) => l.get(i).copied(),
+        }
+    }
+
+    /// Номер дистанции `d` среди вариантов.
+    pub fn position(&self, d: i32) -> Option<usize> {
+        match self {
+            DistanceChoices::Range(max) => (1..=*max).contains(&d).then(|| d as usize - 1),
+            DistanceChoices::List(l) => l.iter().position(|x| *x == d),
+        }
+    }
+}
+
 impl Activation {
     /// Дистанции для ползунка в меню (пусто — ползунка нет).
-    pub fn distance_choices(&self) -> Vec<i32> {
+    pub fn distance_choices(&self) -> DistanceChoices {
         match self.distances.as_slice() {
-            [-1, max] if *max >= 1 => (1..=*max).collect(),
-            list => list.iter().copied().filter(|d| *d > 0).collect(),
+            [-1, max] if *max >= 1 => DistanceChoices::Range(*max),
+            list => DistanceChoices::List(list.iter().copied().filter(|d| *d > 0).collect()),
         }
     }
 
@@ -347,7 +408,7 @@ pub fn activation_distances_packet(list: &[([u8; 16], i32)]) -> Vec<u8> {
 /// Читает линии источников и активации. Не падает целиком: что успели разобрать, то и вернём,
 /// а в `note` будет написано, на каком шаге остановились.
 fn parse_activations(r: &mut Reader) -> Activations {
-    let mut out = Activations { list: Vec::new(), proximity_distance: None, note: "ok" };
+    let mut out = Activations { lines: Vec::new(), list: Vec::new(), proximity_distance: None, note: "ok" };
     if let Err(why) = read_activations(r, &mut out) {
         out.note = why;
     }
@@ -360,7 +421,7 @@ fn read_activations(r: &mut Reader, out: &mut Activations) -> Result<(), &'stati
         return Err("число линий вне диапазона");
     }
     for _ in 0..lines {
-        r.skip_utf().ok_or("имя линии")?;
+        out.lines.push(r.utf().ok_or("имя линии")?);
         r.skip_utf().ok_or("перевод линии")?;
         r.skip_utf().ok_or("иконка линии")?;
         r.bytes(8).ok_or("громкость линии")?; // defaultVolume
@@ -483,6 +544,39 @@ fn udp_header(out: &mut Vec<u8>, ty: u8, secret: &[u8; 16], now_ms: u64) {
     out.extend_from_slice(&(now_ms as i64).to_be_bytes());
 }
 
+/// Строка Java `writeUTF` (modified UTF-8): эмодзи и прочее вне BMP там — пара суррогатов по 3 байта,
+/// а NUL — `C0 80`. Обычный UTF-8 такое не принимает, и из-за одного 🐰 в названии пластинки
+/// терялся весь пакет. Склеиваем пары; что не разобрать — заменяем на «�», но строку не теряем.
+pub fn java_utf(b: &[u8]) -> String {
+    if let Ok(s) = std::str::from_utf8(b) {
+        return s.to_string();
+    }
+    let mut units: Vec<u16> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        let (u, n) = if c < 0x80 {
+            (c as u16, 1)
+        } else if c & 0xE0 == 0xC0 && i + 1 < b.len() {
+            ((((c & 0x1F) as u16) << 6) | (b[i + 1] & 0x3F) as u16, 2)
+        } else if c & 0xF0 == 0xE0 && i + 2 < b.len() {
+            ((((c & 0x0F) as u16) << 12) | (((b[i + 1] & 0x3F) as u16) << 6) | (b[i + 2] & 0x3F) as u16, 3)
+        } else if c & 0xF8 == 0xF0 && i + 3 < b.len() {
+            // настоящий 4-байтный UTF-8 вперемешку: раскладываем на пару
+            let cp = (((c & 0x07) as u32) << 18) | (((b[i + 1] & 0x3F) as u32) << 12) | (((b[i + 2] & 0x3F) as u32) << 6) | (b[i + 3] & 0x3F) as u32;
+            let mut buf = [0u16; 2];
+            units.extend_from_slice(char::from_u32(cp).unwrap_or('\u{FFFD}').encode_utf16(&mut buf));
+            i += 4;
+            continue;
+        } else {
+            (0xFFFD, 1)
+        };
+        units.push(u);
+        i += n;
+    }
+    String::from_utf16_lossy(&units)
+}
+
 /// UDP PlayerAudioPacket: seq, данные (уже зашифрованные), activationId, дистанция, stereo.
 pub fn udp_player_audio(
     secret: &[u8; 16],
@@ -577,6 +671,16 @@ mod tests {
         assert_eq!(b[0] as usize, "minecraft:register".len());
         assert_eq!(&b[1..19], "minecraft:register".as_bytes());
         assert_eq!(&b[19..], [1, 2, 3]);
+    }
+
+    #[test]
+    fn java_utf_reads_emoji_and_nul() {
+        // 🐰 = U+1F430 = D83D DC30 → ED A0 BD ED B0 B0
+        assert_eq!(java_utf(&[b'H', b'i', 0xED, 0xA0, 0xBD, 0xED, 0xB0, 0xB0]), "Hi🐰");
+        assert_eq!(java_utf(&[b'a', 0xC0, 0x80, b'b']), "a\0b");
+        assert_eq!(java_utf("Жми ♥ 🐰".as_bytes()), "Жми ♥ 🐰");
+        let mut r = Reader::new(&[0, 6, 0xED, 0xA0, 0xBD, 0xED, 0xB0, 0xB0]);
+        assert_eq!(r.utf().as_deref(), Some("🐰"));
     }
 
     #[test]
@@ -701,6 +805,7 @@ mod tests {
         assert_eq!(c.activations_note, "ok");
         assert_eq!(c.activation_names, ["proximity", "groups"]);
         assert_eq!(c.proximity_distance, Some(16));
+        assert_eq!(c.line_names, ["vip"]);
     }
 
     #[test]
@@ -710,7 +815,7 @@ mod tests {
         assert_eq!(prox.id, activation_id("proximity"));
         assert_eq!(prox.distances, [8, 16, 32]);
         assert_eq!((prox.default_distance, prox.proximity, prox.transitive, prox.weight), (16, true, false, 1));
-        assert_eq!(prox.distance_choices(), [8, 16, 32]);
+        assert_eq!(prox.distance_choices(), DistanceChoices::List(vec![8, 16, 32]));
         assert_eq!(prox.allowed_distance(32), 32);
         assert_eq!(prox.allowed_distance(20), 16, "чего нет в списке — по умолчанию");
         // ActivationRegister — та же запись отдельно
@@ -726,6 +831,11 @@ mod tests {
         body.extend_from_slice(&5i32.to_be_bytes());
         let g = parse_activation_register(&body).unwrap();
         assert_eq!(g.distance_choices().len(), 64, "[-1, 64] — любая от 1 до 64");
+        assert_eq!(g.distance_choices().get(0), Some(1));
+        assert_eq!(g.distance_choices().get(63), Some(64));
+        assert_eq!(g.distance_choices().get(64), None);
+        assert_eq!(g.distance_choices().position(40), Some(39));
+        assert_eq!(g.distance_choices().position(65), None);
         assert_eq!(g.allowed_distance(40), 40);
         assert_eq!(g.allowed_distance(0), 0);
         assert!(g.transitive && !g.proximity);
@@ -808,6 +918,33 @@ mod tests {
     }
 
     #[test]
+    fn huge_server_distance_range_is_not_allocated() {
+        // сервер прислал [-1, 2^31 - 1]: список занял бы ~8 ГБ, диапазон — ничего
+        let a = Activation {
+            name: "proximity".into(),
+            translation: String::new(),
+            id: activation_id("proximity"),
+            distances: vec![-1, i32::MAX],
+            default_distance: 16,
+            proximity: true,
+            transitive: false,
+            stereo: false,
+            weight: 0,
+        };
+        let c = a.distance_choices();
+        assert_eq!(c, DistanceChoices::Range(i32::MAX));
+        assert_eq!(c.len(), i32::MAX as usize);
+        assert_eq!(c.get(c.len() - 1), Some(i32::MAX));
+        assert_eq!(c.get(c.len()), None);
+        assert_eq!(c.position(i32::MAX), Some(c.len() - 1));
+        assert_eq!(c.position(0), None);
+        assert_eq!(c.position(-5), None);
+        // [-1, 0] и прочие пустые варианты — ползунка нет
+        let none = Activation { distances: vec![-1, 0], ..a.clone() };
+        assert!(none.distance_choices().is_empty());
+    }
+
+    #[test]
     fn connection_parses() {
         let mut b = vec![0xab; 16];
         b.extend_from_slice(&[0, 9]);
@@ -818,5 +955,15 @@ mod tests {
         assert_eq!(c.port, 25565);
         assert_eq!(c.secret_hex.len(), 32);
         assert!(parse_connection(&b[..10]).is_none());
+    }
+
+    /// Сервер слушает все адреса (0.0.0.0): голос идёт на адрес игрового сервера, как у клиента Plasmo.
+    #[test]
+    fn any_address_means_the_game_server() {
+        assert_eq!(udp_host("0.0.0.0", "5.83.140.202:25765"), "5.83.140.202");
+        assert_eq!(udp_host("", "mc.example.org"), "mc.example.org");
+        assert_eq!(udp_host("::", "[2001:db8::1]:25565"), "2001:db8::1");
+        assert_eq!(udp_host("voice.example.org", "mc.example.org"), "voice.example.org", "свой адрес не трогаем");
+        assert_eq!(udp_host("10.0.0.5", "mc.example.org"), "10.0.0.5");
     }
 }

@@ -21,6 +21,9 @@ pub trait Canvas {
     /// Голова игрока (лицо 8×8 и второй слой из скина) в квадрате `size`×`size`. `skin` — имя текстуры скина.
     /// Холст без картинок ничего не рисует, и меню тогда ставит заглушку.
     fn face(&mut self, _skin: &str, _x: i32, _y: i32, _size: i32) {}
+    /// Часть той же головы: строки скина `from..from+rows` (из 8), с `y` — для строк списка, обрезанных
+    /// краем (картинку иначе не обрезать: у холста нет «ножниц»).
+    fn face_part(&mut self, _skin: &str, _x: i32, _y: i32, _size: i32, _from: i32, _rows: i32) {}
 }
 
 // ---------- цвета (ванильная палитра: серые кнопки, чёрные рамки, белый текст; один фирменный акцент) ----------
@@ -89,7 +92,8 @@ pub fn text_width(s: &str) -> i32 {
             'l' | '\'' | '`' => 3,
             ' ' | 'I' | 't' | '[' | ']' | '*' => 4,
             'f' | 'k' | '<' | '>' | '(' | ')' => 5,
-            '@' | '~' => 7,
+            '@' | '~' | '«' | '»' => 7,
+            '—' | '…' => 9,
             _ => 6,
         })
         .sum()
@@ -110,12 +114,13 @@ enum Tab {
     Players,
     Activation,
     Overlay,
+    Groups,
     Status,
     Controls,
 }
 
 /// Порядок вкладок как в Plasmo Voice: Устройства, Громкость, Активации, Оверлей, Продвинутые, Клавиши.
-const TABS: [Tab; 6] = [Tab::Devices, Tab::Players, Tab::Activation, Tab::Overlay, Tab::Status, Tab::Controls];
+const TABS: [Tab; 7] = [Tab::Devices, Tab::Players, Tab::Activation, Tab::Overlay, Tab::Groups, Tab::Status, Tab::Controls];
 const TITLE: &str = "Rust Voice";
 /// Версия мода из Cargo.toml.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -127,6 +132,7 @@ impl Tab {
             Tab::Players => "Громкость",
             Tab::Activation => "Активации",
             Tab::Overlay => "Оверлей",
+            Tab::Groups => "Группы",
             Tab::Controls => "Клавиши",
             Tab::Status => "Продвинутые",
         }
@@ -141,6 +147,8 @@ impl Tab {
             (Tab::Activation, false) => &icons::TAB_ACTIVATION_OFF,
             (Tab::Overlay, true) => &icons::TAB_OVERLAY,
             (Tab::Overlay, false) => &icons::TAB_OVERLAY_OFF,
+            (Tab::Groups, true) => &icons::TAB_GROUPS,
+            (Tab::Groups, false) => &icons::TAB_GROUPS_OFF,
             (Tab::Controls, true) => &icons::TAB_HOTKEYS,
             (Tab::Controls, false) => &icons::TAB_HOTKEYS_OFF,
             (Tab::Status, true) => &icons::TAB_ADVANCED,
@@ -167,6 +175,18 @@ struct State {
     /// Строка поиска во вкладке «Громкость» и в фокусе ли она (по умолчанию да, как в Plasmo).
     search: String,
     search_focus: bool,
+    /// Вкладка «Группы»: какое поле в фокусе и что в полях. `join_id` — группа с паролем, для которой
+    /// раскрыто поле пароля.
+    group_field: Option<GroupField>,
+    group_name: String,
+    group_pass: String,
+    /// Тип новой группы SVC (по умолчанию «обычная»: «Группы» — группе, «Локальный» — только рядом).
+    group_kind: crate::svc::GroupKind,
+    join_pass: String,
+    /// Строки поиска вкладки «Группы»: группы и игроки, кого позвать.
+    group_find: String,
+    invite_find: String,
+    join_id: Option<String>,
     /// Громкость до «выключить» у кнопки с динамиком: (ключ, проценты). Ключ — ник или `\0local`/`\0group`.
     muted_prev: Vec<(String, u32)>,
     /// Анимации. Появление окна и проявление страницы после смены вкладки (оба 0..1, 1 — готово),
@@ -200,6 +220,14 @@ static ST: Mutex<State> = Mutex::new(State {
     last_draw: None,
     search: String::new(),
     search_focus: true,
+    group_field: None,
+    group_name: String::new(),
+    group_pass: String::new(),
+    group_kind: crate::svc::GroupKind::Normal,
+    join_pass: String::new(),
+    group_find: String::new(),
+    invite_find: String::new(),
+    join_id: None,
     muted_prev: Vec::new(),
     open_t: 0.0,
     tab_t: 1.0,
@@ -231,6 +259,8 @@ pub fn set_gui_size(w: i32, h: i32) {
 
 /// Меню открывают заново: забыть зажатые кнопки.
 pub fn on_open() {
+    // свежий список устройств: подписи у выбранного микрофона и наушников (и без голосового сервера)
+    S::request_mic_refresh();
     let mut st = lock();
     st.down = false;
     st.pressed = false;
@@ -261,12 +291,16 @@ pub fn on_scroll(dy: f32) -> bool {
             S::set_mic_scroll((S::mic_scroll() as i32 - rows).max(0) as usize);
             true
         }
-        Tab::Devices | Tab::Activation | Tab::Status | Tab::Controls | Tab::Overlay => {
+        Tab::Devices | Tab::Activation | Tab::Status | Tab::Controls | Tab::Overlay | Tab::Groups => {
             st.dev_scroll = (st.dev_scroll - dy * DEV_ROW as f32).clamp(0.0, st.dev_max);
             true
         }
         Tab::Players => {
             S::set_players_scroll((S::players_scroll() as i32 - rows).max(0) as usize);
+            // список поехал: ползунок игрока отпускаем, чтобы колесо не меняло громкость под рукой
+            if st.active >= PLAYER_SLIDER_BASE {
+                st.active = 0;
+            }
             true
         }
         _ => false,
@@ -305,7 +339,11 @@ pub fn press() -> bool {
 /// (клавиша минус) и Backspace идут в поиск. Возвращает true, если клавишу забрало поле (меню по ней не закрывать).
 pub fn on_key(key: &str, pressed: bool) -> bool {
     let mut st = lock();
-    if !st.last_draw.is_some_and(|t| t.elapsed() < Duration::from_millis(300)) || st.tab != Tab::Players || !st.search_focus {
+    let live = st.last_draw.is_some_and(|t| t.elapsed() < Duration::from_millis(300));
+    if live && st.tab == Tab::Groups {
+        return group_key(&mut st, key, pressed);
+    }
+    if !live || st.tab != Tab::Players || !st.search_focus {
         return false;
     }
     let Some(k) = key.strip_prefix("key.keyboard.") else { return false };
@@ -328,6 +366,106 @@ pub fn on_key(key: &str, pressed: bool) -> bool {
                 st.search.pop();
             }
         }
+    }
+    true
+}
+
+/// Поле ввода вкладки «Группы».
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GroupField {
+    Name,
+    Pass,
+    /// Пароль для входа в группу `join_id`.
+    Join,
+    /// Поиск группы (по названию или нику участника).
+    Find,
+    /// Поиск игрока в «Позвать в группу».
+    Invite,
+}
+
+/// Сколько символов в строках поиска вкладки «Группы».
+const FIND_MAX: usize = 24;
+
+/// Набранный символ (экран мода, любые буквы, в том числе русские). true — его забрало поле вкладки «Группы».
+pub fn on_char(c: char) -> bool {
+    let mut st = lock();
+    if !st.last_draw.is_some_and(|t| t.elapsed() < Duration::from_millis(300)) || st.tab != Tab::Groups {
+        return false;
+    }
+    let Some(f) = st.group_field else { return false };
+    if c.is_control() {
+        return true;
+    }
+    let (buf, max) = match f {
+        GroupField::Name => (&mut st.group_name, crate::groups::NAME_MAX),
+        GroupField::Pass => (&mut st.group_pass, crate::groups::PASS_MAX),
+        GroupField::Join => (&mut st.join_pass, crate::groups::PASS_MAX),
+        GroupField::Find => (&mut st.group_find, FIND_MAX),
+        GroupField::Invite => (&mut st.invite_find, FIND_MAX),
+    };
+    // «:» аддон считает началом флага, в пароле пробелы не нужны (в поиске — любые символы, кроме пробела в нике)
+    let search = matches!(f, GroupField::Find | GroupField::Invite);
+    let banned = if search { f == GroupField::Invite && c.is_whitespace() } else { c == ':' || (f != GroupField::Name && c.is_whitespace()) };
+    if !banned && buf.chars().count() < max {
+        buf.push(c);
+    }
+    true
+}
+
+/// Отправить то, что набрано в поле `f` (Enter или кнопка).
+fn submit_group_field(st: &mut State, f: GroupField) {
+    match f {
+        GroupField::Name | GroupField::Pass => {
+            if crate::groups::create(&st.group_name, &st.group_pass, st.group_kind) {
+                st.group_name.clear();
+                st.group_pass.clear();
+                st.group_field = None;
+            } else {
+                st.group_field = Some(GroupField::Name);
+            }
+        }
+        // поиск фильтрует сразу, Enter просто убирает курсор
+        GroupField::Find | GroupField::Invite => st.group_field = None,
+        GroupField::Join => {
+            let id = st.join_id.clone();
+            if let Some(g) = id.and_then(|id| crate::groups::list().into_iter().find(|g| g.id == id)) {
+                crate::groups::join(&g, &st.join_pass);
+            }
+            st.join_pass.clear();
+            st.join_id = None;
+            st.group_field = None;
+        }
+    }
+}
+
+/// Клавиша, пока в фокусе поле вкладки «Группы»: Backspace стирает, Enter отправляет, Esc снимает фокус.
+/// Остальные клавиши тоже забираем (буквы приходят через `on_char`), чтобы они не закрыли меню и не включили рацию.
+fn group_key(st: &mut State, key: &str, pressed: bool) -> bool {
+    let Some(f) = st.group_field else { return false };
+    if !pressed {
+        return true;
+    }
+    match key {
+        "key.keyboard.backspace" => {
+            let buf = match f {
+                GroupField::Name => &mut st.group_name,
+                GroupField::Pass => &mut st.group_pass,
+                GroupField::Join => &mut st.join_pass,
+                GroupField::Find => &mut st.group_find,
+                GroupField::Invite => &mut st.invite_find,
+            };
+            buf.pop();
+        }
+        "key.keyboard.enter" | "key.keyboard.keypad.enter" => submit_group_field(st, f),
+        "key.keyboard.tab" => {
+            st.group_field = match f {
+                GroupField::Name => Some(GroupField::Pass),
+                GroupField::Pass => Some(GroupField::Name),
+                other => Some(other),
+            }
+        }
+        "key.keyboard.escape" => st.group_field = None,
+        _ => {}
     }
     true
 }
@@ -432,18 +570,31 @@ pub struct Fx {
     /// Подмешать цвет `tint` (RGB) на долю `tint_t` (0..1).
     pub tint: u32,
     pub tint_t: f32,
+    /// Ширина по горизонтали: 1 — как есть, 0 — ребром, меньше нуля — обратной стороной (монетка крутится).
+    pub flip: f32,
 }
 
 impl Fx {
-    pub const NONE: Fx =
-        Fx { a: 1.0, dx: 0.0, dy: 0.0, glint: -1.0, ripple_from: 0, ripple: 0.0, phase: 0.0, spin: 0.0, tint: 0, tint_t: 0.0 };
+    pub const NONE: Fx = Fx {
+        a: 1.0,
+        dx: 0.0,
+        dy: 0.0,
+        glint: -1.0,
+        ripple_from: 0,
+        ripple: 0.0,
+        phase: 0.0,
+        spin: 0.0,
+        tint: 0,
+        tint_t: 0.0,
+        flip: 1.0,
+    };
 }
 
 /// Иконка с эффектами `fx`. Без эффектов рисуется быстро, готовыми отрезками.
 pub fn draw_icon_fx(c: &mut dyn Canvas, icon: &Icon, x: i32, y: i32, scale: i32, fx: Fx) {
     let ox = x + (fx.dx * scale as f32).round() as i32;
     let oy = y + (fx.dy * scale as f32).round() as i32;
-    if fx.glint < 0.0 && fx.ripple <= 0.0 && fx.spin == 0.0 && fx.tint_t <= 0.0 {
+    if fx.glint < 0.0 && fx.ripple <= 0.0 && fx.spin == 0.0 && fx.tint_t <= 0.0 && fx.flip == 1.0 {
         for &(rx, ry, n, argb) in icon.runs {
             c.fill(ox + rx as i32 * scale, oy + ry as i32 * scale, n as i32 * scale, scale, mul_alpha(argb, fx.a));
         }
@@ -498,9 +649,137 @@ pub fn draw_icon_fx(c: &mut dyn Canvas, icon: &Icon, x: i32, y: i32, scale: i32,
             if fx.tint_t > 0.0 {
                 col = lerp_argb(col, (col & 0xFF00_0000) | (fx.tint & 0x00FF_FFFF), fx.tint_t.min(1.0));
             }
+            if fx.flip != 1.0 {
+                // монетка крутится: столбец сжимается к середине, обратная сторона темнее
+                let f = fx.flip.clamp(-1.0, 1.0);
+                if f < 0.0 {
+                    col = lerp_argb(col, (col & 0xFF00_0000) | 0x0030_1050, 0.45);
+                }
+                let edge = |gx: f32| ox as f32 + (cx + (gx - cx) * f) * scale as f32;
+                let (l, r) = (edge(px as f32), edge(px as f32 + 1.0));
+                let (l, r) = (l.min(r).round() as i32, l.max(r).round() as i32);
+                let wpx = (r - l).max(if f.abs() < 0.08 && px == w / 2 { 1 } else { 0 });
+                if wpx > 0 {
+                    c.fill(l, oy + py as i32 * scale, wpx, scale, mul_alpha(col, al));
+                }
+                continue;
+            }
             c.fill(ox + px as i32 * scale, oy + py as i32 * scale, scale, scale, mul_alpha(col, al));
         }
     }
+}
+
+// ---------- монетка-значок в шапке ----------
+
+/// Сколько звонов монеты ждут, пока их проиграет `lib.rs` (у меню нет доступа к звукам игры), и их высота.
+pub static COIN_SOUNDS: Mutex<Vec<f32>> = Mutex::new(Vec::new());
+
+struct Coin {
+    /// Когда щёлкнули последние разы (для «много раз подряд»).
+    hits: Vec<Instant>,
+    jump_at: Option<Instant>,
+    flip_at: Option<Instant>,
+    /// Восемь щелчков подряд: когда показали благодарность.
+    thanks_at: Option<Instant>,
+}
+
+static COIN: Mutex<Coin> = Mutex::new(Coin { hits: Vec::new(), jump_at: None, flip_at: None, thanks_at: None });
+/// Где в шапке значок (низ слева): под ним всплывает благодарность.
+static LOGO_AT: Mutex<(i32, i32)> = Mutex::new((8, 24));
+
+/// Столько щелчков за `COIN_COMBO` — и монетка переворачивается.
+const COIN_FLIP_HITS: usize = 5;
+/// Столько щелчков подряд — и под значком благодарность проекту JeleCraft; держится `THANKS_FOR` секунд.
+const COIN_THANKS_HITS: usize = 8;
+const THANKS_FOR: f32 = 5.0;
+const COIN_COMBO: Duration = Duration::from_millis(1600);
+const COIN_JUMP: f32 = 0.35;
+const COIN_FLIP: f32 = 0.7;
+
+fn coin_click() {
+    let now = Instant::now();
+    let Ok(mut c) = COIN.lock() else { return };
+    c.hits.retain(|t| now.duration_since(*t) < COIN_COMBO);
+    c.hits.push(now);
+    c.jump_at = Some(now);
+    let combo = c.hits.len();
+    // пятый щелчок — переворот, восьмой — ещё переворот и благодарность (счёт идёт дальше, пока щёлкают подряд)
+    let thanks = combo >= COIN_THANKS_HITS;
+    let flips = (combo == COIN_FLIP_HITS || thanks) && c.flip_at.is_none_or(|t| now.duration_since(t).as_secs_f32() > COIN_FLIP);
+    if flips {
+        c.flip_at = Some(now);
+    }
+    if thanks {
+        c.thanks_at = Some(now);
+        c.hits.clear();
+    }
+    // звон чуть выше с каждым щелчком подряд; переворот — самый высокий
+    let pitch = if flips { 2.0 } else { (1.0 + combo as f32 * 0.12).min(1.8) };
+    if let Ok(mut q) = COIN_SOUNDS.lock() {
+        if q.len() < 8 {
+            q.push(pitch);
+        }
+    }
+}
+
+/// Благодарность под значком после восьми щелчков: плавно выезжает, держится и гаснет.
+fn draw_thanks(ui: &mut Ui, gw: i32) {
+    let Some(at) = COIN.lock().ok().and_then(|c| c.thanks_at) else { return };
+    let e = at.elapsed().as_secs_f32();
+    if e >= THANKS_FOR {
+        return;
+    }
+    let a = (e / 0.2).min(1.0) * ((THANKS_FOR - e) / 0.6).min(1.0);
+    let (lx, ly) = LOGO_AT.lock().map(|g| *g).unwrap_or((8, 24));
+    let line1 = crate::i18n::tr("Спасибо проекту");
+    let line2 = crate::i18n::tr("за поддержку ♥");
+    let name = "JeleCraft";
+    let w1 = text_width(&format!("{line1} {name}"));
+    let w = w1.max(text_width(&line2)) + 14;
+    let h = 26;
+    let x = lx.min(gw - w - 4).max(2);
+    let y = ly + 4 - ((1.0 - (e / 0.25).min(1.0)) * 4.0) as i32;
+    ui.frame(x, y, w, h, mul_alpha(0xFFA8_55F7, a), mul_alpha(0xF012_0A1E, a));
+    // уголок-стрелка к значку
+    ui.fill(x + 8, y - 1, 3, 1, mul_alpha(0xFFA8_55F7, a));
+    ui.fill(x + 9, y - 2, 1, 1, mul_alpha(0xFFA8_55F7, a));
+    ui.text(&line1, x + 7, y + 4, mul_alpha(TEXT, a));
+    // название проекта — золотом, с бегущим бликом
+    let nx = x + 7 + text_width(&format!("{line1} "));
+    let glow = 0.5 + 0.5 * (e * 4.0).sin();
+    ui.text(name, nx, y + 4, mul_alpha(lerp_argb(0xFFFF_C84A, 0xFFFF_F0B0, glow), a));
+    ui.text(&line2, x + 7, y + 14, mul_alpha(0xFFD8_C8F8, a));
+}
+
+/// Подпрыгивание и переворот монетки (поверх обычного покачивания).
+fn coin_fx(fx: &mut Fx) {
+    let Ok(c) = COIN.lock() else { return };
+    if let Some(t) = c.jump_at {
+        let e = t.elapsed().as_secs_f32();
+        if e < COIN_JUMP {
+            let k = e / COIN_JUMP;
+            fx.dy -= 2.5 * (k * std::f32::consts::PI).sin() * (1.0 - k);
+            fx.spin = 0.25 * (k * std::f32::consts::PI * 3.0).sin() * (1.0 - k);
+        }
+    }
+    if let Some(t) = c.flip_at {
+        let e = t.elapsed().as_secs_f32();
+        if e < COIN_FLIP {
+            let k = e / COIN_FLIP;
+            // ease-out: быстро раскручивается, мягко встаёт на место; два полуоборота = целый оборот
+            let ang = (1.0 - (1.0 - k).powi(3)) * std::f32::consts::TAU;
+            fx.flip = ang.cos();
+            fx.spin = 0.0;
+            fx.dy -= 4.0 * (k * std::f32::consts::PI).sin();
+            fx.tint = 0xFFD7_00;
+            fx.tint_t = 0.35 * (k * std::f32::consts::PI).sin();
+        }
+    }
+}
+
+/// Звоны монеты, которые надо проиграть (высота тона каждого).
+pub fn take_coin_sounds() -> Vec<f32> {
+    COIN_SOUNDS.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default()
 }
 
 /// Что иконка на кнопке делает при наведении и переключении.
@@ -577,6 +856,10 @@ impl Ui<'_> {
 
     fn face(&mut self, skin: &str, x: i32, y: i32, size: i32) {
         self.c.face(skin, x, y, size);
+    }
+
+    fn face_part(&mut self, skin: &str, x: i32, y: i32, size: i32, from: i32, rows: i32) {
+        self.c.face_part(skin, x, y, size, from, rows);
     }
 
     /// Плавно приблизить значение под `key` к `target` (`speed` — чем больше, тем быстрее). Впервые видим
@@ -972,6 +1255,29 @@ fn device_label(value: &str, list: Vec<(String, String)>, default: &str) -> Stri
 }
 
 /// Строка «подпись — переключатель — сброс к значению по умолчанию».
+/// Строка с выбором из нескольких кнопок (как вкладки). Возвращает номер нажатой.
+#[allow(clippy::too_many_arguments)]
+fn seg_row(ui: &mut Ui, x: i32, ry: i32, w: i32, label: &str, tip: &str, opts: &[(&str, &str)], sel: usize) -> Option<usize> {
+    let (cx, cw) = dev_row(ui, x, ry, w, label);
+    ui.tooltip(x, ry, cx - x, 20, tip);
+    let n = opts.len() as i32;
+    let kw = (cw - (n - 1) * 2) / n;
+    let mut hit = None;
+    for (i, (name, otip)) in opts.iter().enumerate() {
+        let bx = cx + i as i32 * (kw + 2);
+        let on = i == sel;
+        let bg = if on { BTN_SEL } else { ui.shade(bx, ry, kw, 20, 0xFF24_2424, BTN_HOVER) };
+        ui.vbox(bx, ry, kw, 20, if on { ACCENT } else { BLACK }, bg);
+        let t = fit(name, kw - 4);
+        ui.text(&t, bx + (kw - text_width(&t)) / 2, ry + 6, TEXT);
+        ui.tooltip(bx, ry, kw, 20, otip);
+        if ui.clicked(bx, ry, kw, 20) && !on {
+            hit = Some(i);
+        }
+    }
+    hit
+}
+
 fn onoff_row(ui: &mut Ui, x: i32, ry: i32, w: i32, label: &str, tip: &str, on: bool, default: bool, enabled: bool) -> bool {
     let rx = x + w - 20;
     let (cx, cw) = dev_row(ui, x, ry, w, label);
@@ -1027,21 +1333,6 @@ fn page_devices(ui: &mut Ui, x: i32, y: i32, w: i32) {
     }
     ry += DEV_ROW;
 
-    if ui.vis(ry, 20) {
-        let v = onoff_row(
-            ui,
-            x,
-            ry,
-            w,
-            "Отключить устройство",
-            "Микрофон закрывается совсем: система не видит, что он занят. Слушать других можно",
-            S::mic_off(),
-            false,
-            true,
-        );
-        S::set_mic_off(v);
-    }
-    ry += DEV_ROW;
 
     // громкость микрофона
     if ui.vis(ry, 20) {
@@ -1057,104 +1348,104 @@ fn page_devices(ui: &mut Ui, x: i32, y: i32, w: i32) {
     }
     ry += DEV_ROW;
 
-    // порог активации: полоса показывает живой уровень микрофона, ручка — порог
+    // включение микрофона: «Авто» — нейросеть слышит речь, «Порог» — по громкости
     if ui.vis(ry, 20) {
-        let (cx, cw) = dev_row(ui, x, ry, w, "Порог активации");
-        let thr = S::threshold();
-        let thr_db = to_db(thr);
-        let level = S::level();
-        let lvl_color = if S::mic_silenced() || S::mic_off() {
-            0xFF70_7070
-        } else if level >= thr {
-            GREEN
-        } else {
-            0xFF2F_7A40
-        };
-        if let Some(v) = ui.slider(2, cx, ry, cw, 20, db_frac(thr_db), (db_frac(to_db(level)), lvl_color)) {
-            S::set_threshold(frac_to_threshold(v));
-        }
-        let t = format!("{} дБ", thr_db.round() as i32);
-        ui.text(&t, cx + (cw - text_width(&t)) / 2, ry + 6, TEXT);
-        ui.tooltip(cx, ry, cw, 20, "Ручка — порог: полоса должна выходить за неё, когда вы говорите");
-        if ui.reset_button(rx, ry, (thr - S::DEFAULT_THRESHOLD).abs() > 1e-6, "Сбросить порог") {
-            S::set_threshold(S::DEFAULT_THRESHOLD);
-            ui.changed = true;
-        }
-    }
-    ry += DEV_ROW;
-
-    // шумоподавление
-    if ui.vis(ry, 20) {
-        let (cx, cw) = dev_row(ui, x, ry, w, "Шумоподавление");
-        let np = S::noise_pct();
-        let t = if np == 0 { "Выкл".to_string() } else { format!("{np}%") };
-        if let Some(v) = ui.mc_slider(4, cx, ry, cw, 20, np as f32 / 100.0, &t, TEXT) {
-            S::set_noise_pct((v * 100.0).round() as u32);
-        }
-        ui.tooltip(x, ry, cx - x, 20, "Своё спектральное: убирает ровный шум (кулер, улица). Сильнее — чище, но голос «плоский»");
-        if ui.reset_button(rx, ry, np != 0, "Выключить") {
-            S::set_noise_pct(0);
-            ui.changed = true;
-        }
-    }
-    ry += DEV_ROW;
-
-    // «Запомнить шум»: 3 секунды тишины, и шумодав точно знает ваш кулер
-    if ui.vis(ry, 20) {
-        let (cx, cw) = dev_row(ui, x, ry, w, "Запомнить шум");
-        ui.tooltip(x, ry, cx - x, 20, "Помолчите 3 секунды: шумодав запомнит ваш фон и не будет глушить долгую речь");
-        let learned = S::noise_profile().is_some();
-        match S::learn_progress() {
-            Some(p) => {
-                // идёт запись: полоса прогресса, просим молчать
-                ui.frame(cx, ry, cw, 20, RUST, P_DEEP);
-                let fw = ((cw - 2) as f32 * p) as i32;
-                if fw > 0 {
-                    ui.fill(cx + 1, ry + 1, fw, 18, RUST_DK);
-                }
-                let left = ((1.0 - p) * crate::denoise::LEARN_SECS).max(0.0);
-                let t = format!("Молчите… {left:.1} с");
-                ui.text(&t, cx + (cw - text_width(&t)) / 2, ry + 6, TEXT);
-            }
-            None => {
-                let label = if learned { "Запомнен ✓ (ещё раз)" } else { "Записать 3 с тишины" };
-                let can = S::connected() && S::mic_ok();
-                let hot = if can { ui.hot(18, cx, ry, cw, 20) } else { 0.0 };
-                ui.vbtn(cx, ry, cw, 20, BTN, BTN_HOVER, hot, if can { 1.0 } else { 0.5 });
-                ui.text(&fit(label, cw - 8), cx + (cw - text_width(&fit(label, cw - 8))) / 2, ry + 6, if learned { OK } else { TEXT });
-                if !can {
-                    ui.tooltip(cx, ry, cw, 20, "Нужно подключение к голосу и микрофон");
-                } else if ui.clicked(cx, ry, cw, 20) {
-                    S::request_noise_learn();
-                }
-            }
-        }
-        if ui.reset_button(rx, ry, learned && S::learn_progress().is_none(), "Забыть шум") {
-            S::set_noise_profile(None);
-            S::save_noise_profile();
-        }
-    }
-    ry += DEV_ROW;
-
-    if ui.vis(ry, 20) {
-        let v = onoff_row(ui, x, ry, w, "Фильтр гула", "Срезает всё ниже 80 Гц: гул, вентилятор, стук по столу. Голос не трогает", S::hum_filter(), true, true);
-        S::set_hum_filter(v);
-    }
-    ry += DEV_ROW;
-
-    if ui.vis(ry, 20) {
-        let v = onoff_row(
+        if let Some(i) = seg_row(
             ui,
             x,
             ry,
             w,
-            "Автогромкость",
-            "Тихий голос подтягивается сам, громкий смех не хрипит. Подстраивается только пока вы говорите",
-            S::agc_on(),
-            false,
-            true,
-        );
-        S::set_agc_on(v);
+            "Включение микрофона",
+            "Авто: микрофон включается, когда нейросеть слышит речь (клавиатура и кулер не включают). Порог: по громкости, ручку ставите сами",
+            &[("Авто", "Нейросеть решает, говорите ли вы"), ("Порог", "Включается, когда громче порога")],
+            if S::vad_ai() { 0 } else { 1 },
+        ) {
+            S::set_vad_ai(i == 0);
+            ui.changed = true;
+        }
+    }
+    ry += DEV_ROW;
+    if S::vad_ai() {
+        // полоса «слышу речь»: уверенность нейросети, зелёная — микрофон включился бы
+        if ui.vis(ry, 20) {
+            let (cx, cw) = dev_row(ui, x, ry, w, "Слышу речь");
+            let p = S::speech().clamp(0.0, 1.0);
+            ui.frame(cx, ry, cw, 20, BORDER, FIELD);
+            let fw = ((cw - 2) as f32 * p) as i32;
+            if fw > 0 {
+                ui.fill(cx + 1, ry + 1, fw, 18, if p >= 0.6 { GREEN } else { 0xFF2F_7A40 });
+            }
+            let t = format!("{}%", (p * 100.0).round() as i32);
+            ui.text(&t, cx + (cw - text_width(&t)) / 2, ry + 6, TEXT);
+            ui.tooltip(cx, ry, cw, 20, "Насколько нейросеть уверена, что вы говорите. Скажите что-нибудь — полоса станет зелёной");
+        }
+        ry += DEV_ROW;
+    } else {
+        // порог активации: полоса показывает живой уровень микрофона, ручка — порог
+        if ui.vis(ry, 20) {
+            let (cx, cw) = dev_row(ui, x, ry, w, "Порог активации");
+            let thr = S::threshold();
+            let thr_db = to_db(thr);
+            let level = S::level();
+            let lvl_color = if S::mic_silenced() || S::mic_off() {
+                0xFF70_7070
+            } else if level >= thr {
+                GREEN
+            } else {
+                0xFF2F_7A40
+            };
+            if let Some(v) = ui.slider(2, cx, ry, cw, 20, db_frac(thr_db), (db_frac(to_db(level)), lvl_color)) {
+                S::set_threshold(frac_to_threshold(v));
+            }
+            let t = if S::vad_ai() {
+                format!("{} · {}%", crate::i18n::tr("речь"), (S::speech() * 100.0).round() as i32)
+            } else {
+                format!("{} дБ", thr_db.round() as i32)
+            };
+            ui.text(&t, cx + (cw - text_width(&t)) / 2, ry + 6, if S::vad_ai() && S::speech() >= 0.6 { GREEN } else { TEXT });
+            ui.tooltip(
+                cx,
+                ry,
+                cw,
+                20,
+                if S::vad_ai() {
+                    "Включается нейросеть: когда слышит речь (цифра — её уверенность). Порог здесь не нужен"
+                } else {
+                    "Ручка — порог: полоса должна выходить за неё, когда вы говорите"
+                },
+            );
+            if ui.reset_button(rx, ry, (thr - S::DEFAULT_THRESHOLD).abs() > 1e-6, "Сбросить порог") {
+                S::set_threshold(S::DEFAULT_THRESHOLD);
+                ui.changed = true;
+            }
+        }
+        ry += DEV_ROW;
+    }
+
+    // шумоподавление: выкл или нейросеть RNNoise
+    if ui.vis(ry, 20) {
+        let cur = if S::noise_pct() == 0 { 0 } else { 1 };
+        if let Some(i) = seg_row(
+            ui,
+            x,
+            ry,
+            w,
+            "Шумоподавление",
+            "Нейросеть RNNoise, как в Plasmo Voice: лёгкая, задержка 10 мс",
+            &[("Выкл", "Без шумоподавления"), ("Вкл", "RNNoise: лёгкое, задержка 10 мс")],
+            cur,
+        ) {
+            match i {
+                0 => S::set_noise_pct(0),
+                _ => {
+                    S::set_noise_ai(true);
+                    if S::noise_pct() == 0 {
+                        S::set_noise_pct(100);
+                    }
+                }
+            }
+            ui.changed = true;
+        }
     }
     ry += DEV_ROW + 6;
 
@@ -1182,7 +1473,8 @@ fn page_devices(ui: &mut Ui, x: i32, y: i32, w: i32) {
     ry += DEV_ROW;
 
     if ui.vis(ry, 20) {
-        let (cx, cw) = dev_row(ui, x, ry, w, "Громкость голосового чата");
+        // тот же ползунок, что «Локальный» во вкладке «Громкость»: группы и музыку он не трогает
+        let (cx, cw) = dev_row(ui, x, ry, w, "Громкость голосов рядом");
         let vp = S::voice_volume_pct();
         if let Some(v) = ui.mc_slider(3, cx, ry, cw, 20, vp as f32 / 200.0, &format!("{vp}%"), slider_color(vp)) {
             S::set_voice_volume_pct((v * 200.0).round() as u32);
@@ -1194,60 +1486,27 @@ fn page_devices(ui: &mut Ui, x: i32, y: i32, w: i32) {
     }
     ry += DEV_ROW;
 
+    // объёмный звук: заглушение стенами, обход углов, направление и HRTF — одним переключателем
+    // (по отдельности — в «Продвинутых»)
     if ui.vis(ry, 20) {
+        let any = S::occlusion_on() || S::routes_on() || S::directional_on() || S::hrtf_on();
         let v = onoff_row(
             ui,
             x,
             ry,
             w,
-            "Заглушение через блоки",
-            "За стеной голос не только тише, но и глуше, как в жизни. Стекло звук пропускает",
-            S::occlusion_on(),
+            "Объёмный звук",
+            "Голос звучит оттуда, где стоит игрок: за стеной глуше, из соседней комнаты — со стороны двери, в наушниках слышно и спереди-сзади",
+            any,
             true,
             true,
         );
-        S::set_occlusion_on(v);
-    }
-    ry += DEV_ROW;
-
-    if ui.vis(ry, 20) {
-        let v = onoff_row(
-            ui,
-            x,
-            ry,
-            w,
-            "Звук огибает углы",
-            "Голос из-за стены идёт в обход: через двери, окна и проёмы, и слышно его со стороны проёма",
-            S::routes_on(),
-            true,
-            S::occlusion_on(),
-        );
-        S::set_routes_on(v);
-    }
-    ry += DEV_ROW;
-
-    let stereo = S::out_stereo() || !S::connected();
-    if ui.vis(ry, 20) {
-        let tip = if stereo { "Голос слышно с той стороны, где стоит игрок" } else { "Устройство вывода моно: направление не слышно" };
-        let v = onoff_row(ui, x, ry, w, "Направленные источники", tip, S::directional_on(), true, stereo);
-        S::set_directional_on(v);
-    }
-    ry += DEV_ROW;
-
-    if ui.vis(ry, 20) {
-        let ok = stereo && S::directional_on();
-        let v = onoff_row(
-            ui,
-            x,
-            ry,
-            w,
-            "HRTF",
-            "Объём в наушниках: задержка между ушами и «тень головы», сзади голос глуше, чем спереди",
-            S::hrtf_on(),
-            true,
-            ok,
-        );
-        S::set_hrtf_on(v);
+        if v != any {
+            S::set_occlusion_on(v);
+            S::set_routes_on(v);
+            S::set_directional_on(v);
+            S::set_hrtf_on(v);
+        }
     }
     ry += DEV_ROW + 4;
 
@@ -1276,14 +1535,11 @@ fn page_devices(ui: &mut Ui, x: i32, y: i32, w: i32) {
         if ui.clicked(x, ry, 150, 18) {
             S::set_mic_test(!testing);
         }
-        let hint = if !S::connected() {
-            ("Нужно подключение к голосу", ERR)
-        } else if !S::mic_ok() {
+        // без голосового сервера проверка тоже работает (своя сессия без сети, lib.rs)
+        let hint = if testing && !S::mic_ok() {
             ("Микрофон не доступен", ERR)
-        } else if testing && S::push_to_talk() {
-            ("Держите клавишу рации", DIM)
         } else if testing {
-            ("Говорите: вы слышите себя", OK)
+            ("Говорите: вы слышите себя, другие — нет", OK)
         } else {
             ("Лучше в наушниках", DIM)
         };
@@ -1309,20 +1565,30 @@ fn page_devices(ui: &mut Ui, x: i32, y: i32, w: i32) {
     }
 }
 
-/// Сколько игроков сейчас слышно в обход стен: пишет lib.rs (меню не зависит от API игры), читает «Продвинутые».
-pub static ROUTED_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// Номера ползунков: 1..=4 заняты страницами «Устройства» и «Продвинутые», 10 и 11 — источники,
-/// игроки идут с этого номера плюс номер строки.
-const PLAYER_SLIDER_BASE: u32 = 100;
+/// Номера ползунков: 1..=4 заняты страницами «Устройства» и «Продвинутые», 10..=12 — источники,
+/// 200.. — дистанции активаций. Игроки — с этого номера: номер считается от ника, а не от строки,
+/// чтобы зажатый ползунок не переезжал на другого игрока, когда список прокручивают.
+const PLAYER_SLIDER_BASE: u32 = 1000;
+/// Сколько номеров отведено игрокам (влезает в 20 бит `akey`).
+const PLAYER_SLIDER_SPAN: u32 = 500_000;
+
+/// Номер ползунка игрока: один и тот же для ника, где бы в списке ни была его строка.
+fn player_slider_id(nick: &str) -> u32 {
+    let h = nick.to_lowercase().bytes().fold(0x811C_9DC5u32, |h, b| (h ^ b as u32).wrapping_mul(0x0100_0193));
+    PLAYER_SLIDER_BASE + h % PLAYER_SLIDER_SPAN
+}
 const SRC_LOCAL: u32 = 10;
 const SRC_GROUP: u32 = 11;
+const SRC_MUSIC: u32 = 12;
 /// Размеры строки игрока, как в Plasmo: голова 24×24, ползунок 100×20 и две кнопки 20×20.
 const FACE: i32 = 24;
-const ROW_H: i32 = 30;
+/// Шаг строк: карточка 26 и зазор 2 (на экране 1080p с масштабом 3 так помещается шесть игроков).
+const ROW_H: i32 = 28;
 const CTL_W: i32 = 100 + 4 + 20 + 4 + 20;
 const KEY_LOCAL: &str = "\0local";
 const KEY_GROUP: &str = "\0group";
+const KEY_MUSIC: &str = "\0music";
 
 fn pct_label(pct: u32) -> String {
     format!("{pct}%")
@@ -1387,16 +1653,31 @@ fn page_players(ui: &mut Ui, x: i32, y: i32, w: i32) {
         S::set_voice_volume_pct(np);
         ui.changed = true;
     }
-    let group = S::group_volume_pct();
-    if let Some(np) = source_row(ui, SRC_GROUP, x, y + 42, w, &icons::SPK_GROUP, "Группы", KEY_GROUP, group) {
-        S::set_group_volume_pct(np);
-        ui.changed = true;
+    // «Группы» и «Музыка и звуки» видны, только если сервер их умеет (стоят аддоны групп или пластинок)
+    let mut ry = y + 42;
+    if S::server_has_groups() {
+        let group = S::group_volume_pct();
+        if let Some(np) = source_row(ui, SRC_GROUP, x, ry, w, &icons::SPK_GROUP, "Группы", KEY_GROUP, group) {
+            S::set_group_volume_pct(np);
+            ui.changed = true;
+        }
+        ry += 24;
     }
-
-    heading(ui, x, w, "Громкость игроков", y + 71);
+    if S::server_has_world() {
+        let music = S::music_volume_pct();
+        if let Some(np) = source_row(ui, SRC_MUSIC, x, ry, w, &icons::NOTE, "Музыка и звуки", KEY_MUSIC, music) {
+            S::set_music_volume_pct(np);
+            ui.changed = true;
+        }
+        ui.tooltip(x, ry, w - CTL_W - 4, 20, "Пластинки и другие звуки из мира, которые шлёт сервер (например, pv-addon-discs)");
+        ry += 24;
+    }
+    // дальше всё сдвигается вверх на столько строк, сколько скрыто
+    let y = ry + 5 - 95;
+    heading(ui, x, w, "Громкость игроков", y + 95);
 
     // Поле поиска: тёмное, с лупой, подсказкой и мигающим золотым курсором, пока в фокусе.
-    let (fy, fh) = (y + 88, 20);
+    let (fy, fh) = (y + 112, 20);
     let (search, focus) = {
         let st = lock();
         (st.search.clone(), st.search_focus)
@@ -1424,7 +1705,7 @@ fn page_players(ui: &mut Ui, x: i32, y: i32, w: i32) {
     let needle = search.to_lowercase();
     let list: Vec<roster::MenuPlayer> =
         roster::menu_players().into_iter().filter(|p| needle.is_empty() || p.nick.to_lowercase().contains(&needle)).collect();
-    let top = y + 116;
+    let top = y + 140;
     if list.is_empty() {
         let msg = if !S::connected() {
             "Нет подключения к голосу."
@@ -1437,18 +1718,36 @@ fn page_players(ui: &mut Ui, x: i32, y: i32, w: i32) {
         return;
     }
 
-    // сколько строк помещается; остальное — колесом мыши
-    let rows = (((ui.gh - top) / ROW_H).max(1) as usize).min(8);
+    // Список доходит до самого низа экрана (у окна снизу нет рамки). Сколько целых строк помещается —
+    // столько и листается колесом; прокрутка плавная: строки едут, а те, что задевает край (снизу экрана
+    // или под поиском), рисуются обрезанными — видно, что список продолжается.
+    let bottom = ui.gh + 8;
+    let rows = (((bottom - top - 26) / ROW_H + 1).max(1) as usize).min(12);
     let scroll = S::players_scroll().min(list.len().saturating_sub(rows));
     S::set_players_scroll(scroll); // игроки вышли — список стал короче, прокрутку подтягиваем
-    for (i, p) in list.iter().enumerate().skip(scroll).take(rows) {
-        let row = i - scroll;
-        let ry = top + row as i32 * ROW_H;
+    let pos = ui.ease(akey(19, x, top), scroll as f32, scroll as f32, 18.0).max(0.0);
+    let first = pos.floor() as usize;
+    let off = ((pos - first as f32) * ROW_H as f32).round() as i32;
+    for (i, p) in list.iter().enumerate().skip(first) {
+        let row = i - first;
+        let ry = top + row as i32 * ROW_H - off;
+        if ry >= bottom {
+            break;
+        }
+        if ry < top - 1 || ry + 26 > bottom {
+            partial_row(ui, p, x, w, ry, top, bottom);
+            if ui.clicked(x - 3, ry.max(top), w + 6, (ry + 26).min(bottom) - ry.max(top)) {
+                S::set_players_scroll(if ry < top { scroll.saturating_sub(1) } else { scroll + 1 });
+                ui.changed = true;
+            }
+            continue;
+        }
         let pct = S::player_volume_pct(&p.nick);
 
         // карточка строки (у говорящего зелёная кромка) и рамка головы, как слот предмета
-        ui.row_hover(x - 3, ry - 2, w + 6, 28);
-        let talk_t = ui.ease(akey(12, x, ry), 0.0, if p.talking { 1.0 } else { 0.0 }, 12.0);
+        ui.row_hover(x - 3, ry - 1, w + 6, 26);
+        let nick_key = p.nick.bytes().fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(b as u64));
+        let talk_t = ui.ease((12 << 44) ^ (nick_key & 0xFFF_FFFF_FFFF), 0.0, if p.talking { 1.0 } else { 0.0 }, 12.0);
         if talk_t > 0.0 {
             ui.fill(x - 1, ry - 1, FACE + 2, FACE + 2, mul_alpha(LED, talk_t));
         }
@@ -1487,7 +1786,7 @@ fn page_players(ui: &mut Ui, x: i32, y: i32, w: i32) {
         // ползунок 0..200%, у середины «липкость»: 100% легко поймать мышью
         let sx = x + w - CTL_W;
         let sy = ry + 2;
-        let id = PLAYER_SLIDER_BASE + row as u32;
+        let id = player_slider_id(&p.nick);
         if let Some(v) = ui.mc_slider(id, sx, sy, 100, 20, pct as f32 / 200.0, &pct_label(pct), slider_color(pct)) {
             let mut np = (v * 200.0).round() as u32;
             if (95..=105).contains(&np) {
@@ -1508,7 +1807,33 @@ fn page_players(ui: &mut Ui, x: i32, y: i32, w: i32) {
         }
     }
 
+    // тень у нижнего края экрана: всегда, а не только пока снизу есть ещё игроки (иначе она «пропадала»,
+    // когда долистаешь до конца)
+    // мягкая, на всю ширину окна (между его боковыми линиями)
+    let shade = 14;
+    for k in 0..shade {
+        let a = (0x70 * (k + 1) / shade) as u32;
+        ui.fill(x - 9, bottom - shade + k, w + 18, 1, a << 24);
+    }
+
     list_scrollbar(ui, x + w + 4, top - 2, rows.min(list.len()) as i32 * ROW_H - 4, scroll, rows, list.len());
+}
+
+/// Строка списка игроков, которую задевает край (низ экрана или верх списка под поиском): видимая часть
+/// головы и, если влезает, бледный ник. Ползунки и кнопки у такой строки не рисуются.
+fn partial_row(ui: &mut Ui, p: &roster::MenuPlayer, x: i32, w: i32, ry: i32, top: i32, bottom: i32) {
+    let px = FACE / 8; // экранных точек на пиксель скина
+    let from = ((top - ry).max(0) + px - 1) / px;
+    let to = (((bottom - ry).min(FACE)) / px).min(8);
+    if to > from {
+        match faces::skin(&p.nick) {
+            Some(skin) => ui.face_part(&skin, x, ry + from * px, FACE, from, to - from),
+            None => ui.fill(x, ry + from * px, FACE, (to - from) * px, 0xFF3A_3A3A),
+        }
+    }
+    if ry + 8 >= top && ry + 8 < bottom {
+        ui.text(&fit(&p.nick, w - CTL_W - FACE - 10), x + FACE + 4, ry + 8, DIM);
+    }
 }
 
 /// Подпись активации: известные по-русски, остальные — имя с большой буквы.
@@ -1623,12 +1948,13 @@ fn page_activation(ui: &mut Ui, x: i32, y: i32, w: i32) {
             if ui.vis(ry, 20) {
                 let (cx, cw) = dev_row(ui, x, ry, w, &format!("Дистанция «{title}»"));
                 let cur = S::act_distance(a);
-                let idx = choices.iter().position(|d| *d == cur).unwrap_or(0);
-                let frac = if choices.len() > 1 { idx as f32 / (choices.len() - 1) as f32 } else { 0.0 };
+                let last = choices.len() - 1;
+                let idx = choices.position(cur).unwrap_or(0);
+                let frac = if last > 0 { (idx as f64 / last as f64) as f32 } else { 0.0 };
                 let id = 200 + n as u32;
                 if let Some(v) = ui.mc_slider(id, cx, ry, cw, 20, frac, &format!("{cur}"), TEXT) {
-                    let i = (v * (choices.len() - 1) as f32).round() as usize;
-                    pref.distance = Some(choices[i.min(choices.len() - 1)]);
+                    let i = (v as f64 * last as f64).round() as usize;
+                    pref.distance = choices.get(i.min(last));
                 }
                 ui.tooltip(x, ry, cx - x, 20, "Дальше — вас слышно дальше. Варианты задаёт сервер");
                 if ui.reset_button(rx, ry, cur != a.default_distance, "Сбросить дистанцию") {
@@ -1656,108 +1982,151 @@ fn page_activation(ui: &mut Ui, x: i32, y: i32, w: i32) {
 const CORNER_NAMES: [&str; 4] = ["Слева сверху", "Справа сверху", "Слева снизу", "Справа снизу"];
 
 fn page_overlay(ui: &mut Ui, x: i32, y: i32, w: i32) {
-    let on = ui.toggle(x, y, w, "Включить оверлей", S::overlay_on());
+    // Раскладка как на других вкладках: y по порядку, рисуется только то, что видно (иначе при прокрутке
+    // строки вылезали за окно меню).
+    let mut ry = y;
+    let section = |ui: &mut Ui, ry: &mut i32, s: &str| {
+        if ui.vis(*ry, 10) {
+            heading(ui, x, w, s, *ry);
+        }
+        *ry += 14;
+    };
+    let toggle = |ui: &mut Ui, ry: &mut i32, label: &str, tip: &str, on: bool| -> bool {
+        let mut v = on;
+        if ui.vis(*ry, 16) {
+            v = ui.toggle(x, *ry, w, label, on);
+            ui.tooltip(x, *ry, w - 32, 16, tip);
+        }
+        *ry += 22;
+        v
+    };
+
+    section(ui, &mut ry, "Кто говорит");
+    let on = toggle(ui, &mut ry, "Список говорящих на экране", "Головы и ники тех, кто сейчас говорит", S::overlay_on());
     S::set_overlay_on(on);
-    let split = ui.toggle(x, y + 24, w, "Группа отдельным списком", S::group_split_on());
+    let split = toggle(ui, &mut ry, "Группа отдельным списком", "Говорящих в вашей группе — в своём углу", S::group_split_on());
     S::set_group_split_on(split);
     if !split {
         S::set_placing_group(false);
     }
 
-    ui.text("Где список говорящих", x, y + 54, TEXT);
-    let mut my0 = y + 66;
+    // где список: схема экрана с четырьмя углами
+    let mut my0 = ry + 2;
     if split {
         // какой список сейчас переставляем: обычный или группы
-        for (i, (grp, label)) in [(false, "Обычные"), (true, "Группа")].into_iter().enumerate() {
-            let (bx, bw) = (x + i as i32 * 62, 60);
-            let sel = S::placing_group() == grp;
-            let bg = if sel { BTN_SEL } else { ui.shade(bx, my0, bw, 16, 0xFF24_2424, BTN_HOVER) };
-            ui.vbox(bx, my0, bw, 16, if sel { ACCENT } else { BLACK }, bg);
-            let color = if grp { TALK_GROUP & 0xFF_FFFF } else { TEXT };
-            ui.text(label, bx + (bw - text_width(label)) / 2, my0 + 4, color);
-            if ui.clicked(bx, my0, bw, 16) {
-                S::set_placing_group(grp);
-                ui.changed = true;
+        if ui.vis(my0, 16) {
+            for (i, (grp, label)) in [(false, "Обычные"), (true, "Группа")].into_iter().enumerate() {
+                let (bx, bw) = (x + i as i32 * 62, 60);
+                let sel = S::placing_group() == grp;
+                let bg = if sel { BTN_SEL } else { ui.shade(bx, my0, bw, 16, 0xFF24_2424, BTN_HOVER) };
+                ui.vbox(bx, my0, bw, 16, if sel { ACCENT } else { BLACK }, bg);
+                let color = if grp { TALK_GROUP & 0xFF_FFFF } else { TEXT };
+                ui.text(label, bx + (bw - text_width(label)) / 2, my0 + 4, color);
+                if ui.clicked(bx, my0, bw, 16) {
+                    S::set_placing_group(grp);
+                    ui.changed = true;
+                }
             }
         }
         my0 += 20;
     }
     let (mx0, mw, mh) = (x, 124, 70);
-    ui.frame(mx0, my0, mw, mh, BORDER, P_DEEP);
-    let zones = [
-        (mx0 + 3, my0 + 3),
-        (mx0 + mw - 3 - 36, my0 + 3),
-        (mx0 + 3, my0 + mh - 3 - 24),
-        (mx0 + mw - 3 - 36, my0 + mh - 3 - 24),
-    ];
-    let near = S::overlay_corner() as usize;
-    let group = S::group_corner() as usize;
-    let placing = if S::placing_group() { group } else { near };
-    for (i, &(zx, zy)) in zones.iter().enumerate() {
-        let has_near = i == near;
-        let has_group = split && i == group;
-        let bg = if has_near || has_group { BTN_SEL } else { ui.shade(zx, zy, 36, 24, 0xFF24_2424, BTN_HOVER) };
-        ui.vbox(zx, zy, 36, 24, if i == placing { ACCENT } else { BLACK }, bg);
-        match (has_near, has_group) {
-            (true, true) => {
-                ui.icon(&icons::MIC, zx + 2, zy + 4, 1);
-                ui.icon(&icons::MIC_GROUP, zx + 18, zy + 4, 1);
+    if ui.vis(my0, mh) {
+        ui.frame(mx0, my0, mw, mh, BORDER, P_DEEP);
+        let zones = [
+            (mx0 + 3, my0 + 3),
+            (mx0 + mw - 3 - 36, my0 + 3),
+            (mx0 + 3, my0 + mh - 3 - 24),
+            (mx0 + mw - 3 - 36, my0 + mh - 3 - 24),
+        ];
+        let near = S::overlay_corner() as usize;
+        let group = S::group_corner() as usize;
+        let placing = if S::placing_group() { group } else { near };
+        for (i, &(zx, zy)) in zones.iter().enumerate() {
+            let has_near = i == near;
+            let has_group = split && i == group;
+            let bg = if has_near || has_group { BTN_SEL } else { ui.shade(zx, zy, 36, 24, 0xFF24_2424, BTN_HOVER) };
+            ui.vbox(zx, zy, 36, 24, if i == placing { ACCENT } else { BLACK }, bg);
+            match (has_near, has_group) {
+                (true, true) => {
+                    ui.icon(&icons::MIC, zx + 2, zy + 4, 1);
+                    ui.icon(&icons::MIC_GROUP, zx + 18, zy + 4, 1);
+                }
+                (true, false) => ui.icon(&icons::MIC, zx + 10, zy + 4, 1),
+                (false, true) => ui.icon(&icons::MIC_GROUP, zx + 10, zy + 4, 1),
+                _ => {}
             }
-            (true, false) => ui.icon(&icons::MIC, zx + 10, zy + 4, 1),
-            (false, true) => ui.icon(&icons::MIC_GROUP, zx + 10, zy + 4, 1),
-            _ => {}
+            ui.tooltip(zx, zy, 36, 24, CORNER_NAMES[i]);
+            if ui.clicked(zx, zy, 36, 24) {
+                if S::placing_group() {
+                    S::set_group_corner(i as u8);
+                } else {
+                    S::set_overlay_corner(i as u8);
+                }
+                ui.changed = true;
+            }
         }
-        ui.tooltip(zx, zy, 36, 24, CORNER_NAMES[i]);
-        if ui.clicked(zx, zy, 36, 24) {
-            if S::placing_group() {
-                S::set_group_corner(i as u8);
-            } else {
-                S::set_overlay_corner(i as u8);
-            }
-            ui.changed = true;
+        let rx = x + mw + 12;
+        if split {
+            ui.text("Обычные:", rx, my0 + 2, DIM);
+            ui.text(CORNER_NAMES[near], rx, my0 + 13, TEXT);
+            ui.text("Группа:", rx, my0 + 28, DIM);
+            ui.text(CORNER_NAMES[group], rx, my0 + 39, TALK_GROUP & 0xFF_FFFF);
+            ui.text("Выберите список и щёлкните угол.", rx, my0 + 56, DIM);
+        } else {
+            ui.text("Угол экрана:", rx, my0 + 8, DIM);
+            ui.text(CORNER_NAMES[near], rx, my0 + 20, TEXT);
+            ui.text("Щёлкните другой угол на схеме.", rx, my0 + 40, DIM);
         }
     }
-    let rx = x + mw + 12;
-    if split {
-        ui.text("Обычные:", rx, my0 + 2, DIM);
-        ui.text(CORNER_NAMES[near], rx, my0 + 13, TEXT);
-        ui.text("Группа:", rx, my0 + 28, DIM);
-        ui.text(CORNER_NAMES[group], rx, my0 + 39, TALK_GROUP & 0xFF_FFFF);
-        ui.text("Выберите список и щёлкните угол.", rx, my0 + 56, DIM);
-    } else {
-        ui.text("Сейчас:", rx, my0 + 8, DIM);
-        ui.text(CORNER_NAMES[near], rx, my0 + 20, TEXT);
+    ry = my0 + mh + 6;
+    if ui.vis(ry, 10) {
+        ui.text("Кто говорит в вашей группе, отмечен фиолетовой рамкой.", x, ry, DIM);
     }
+    ry += 18;
 
-    let mut ry = my0 + mh + 10;
-    ui.text("Значок у хотбара, пока вы говорите:", x, ry, DIM);
-    ry += 12;
-    ui.frame(x, ry, 22, 22, BORDER, 0x5000_0000);
-    ui.icon(&icons::MIC, x + 3, ry + 3, 1);
-    ui.tooltip(x, ry, 22, 22, "Говорите рядом (локальный голос)");
-    ui.text("рядом", x + 26, ry + 7, DIM);
-    let gx = x + 26 + text_width("рядом") + 12;
-    ui.frame(gx, ry, 22, 22, BORDER, 0x5000_0000);
-    ui.icon(&icons::MIC_GROUP, gx + 3, ry + 3, 1);
-    ui.tooltip(gx, ry, 22, 22, "Говорите в группу");
-    ui.text("в группу", gx + 26, ry + 7, DIM);
-    ry += 26;
-    ui.frame(x, ry, 22, 22, BORDER, 0x5000_0000);
-    ui.icon(&icons::MIC_MUTED, x + 3, ry + 3, 1);
-    ui.tooltip(x, ry, 22, 22, "Микрофон выключен");
-    ui.text("микрофон выкл", x + 26, ry + 7, DIM);
-    let hx = x + 26 + text_width("микрофон выкл") + 12;
-    ui.frame(hx, ry, 22, 22, BORDER, 0x5000_0000);
-    ui.icon(&icons::HEADPHONES_OFF, hx + 3, ry + 3, 1);
-    ui.tooltip(hx, ry, 22, 22, "Голосовой чат выключен: вы никого не слышите, и микрофон тоже молчит");
-    ui.text("звук выкл", hx + 26, ry + 7, DIM);
-    ry += 30;
-
-    let tags = ui.toggle(x, ry, w, "Значок статуса над ником игрока", S::nametags_on());
+    section(ui, &mut ry, "Значки");
+    let hb = toggle(
+        ui,
+        &mut ry,
+        "Свой значок над хотбаром",
+        "Микрофон, пока вы говорите (фиолетовый — в группу); перечёркнутые микрофон или наушники — выключены",
+        S::hotbar_icon_on(),
+    );
+    S::set_hotbar_icon_on(hb);
+    let tags = toggle(
+        ui,
+        &mut ry,
+        "Значки над никами игроков",
+        "Говорит, выключен микрофон, выключен звук или у игрока нет голосового мода",
+        S::nametags_on(),
+    );
     S::set_nametags_on(tags);
-    ry += 26;
-    ui.text("Кто говорит в вашей группе, отмечен фиолетовой рамкой.", x, ry, DIM);
-    ry += 14;
+    ry += 4;
+
+    section(ui, &mut ry, "Пластинки");
+    let notes = toggle(ui, &mut ry, "Ноты над играющей пластинкой", "Ноты разбиваются о блоки и сквозь стены не видны", S::notes_on());
+    S::set_notes_on(notes);
+    let label = toggle(ui, &mut ry, "Название трека над пластинкой", "Табличка с названием над проигрывателем", S::disc_label_on());
+    S::set_disc_label_on(label);
+    let glow = toggle(ui, &mut ry, "Блик на проигрывателе", "Пока играет пластинка, по проигрывателю пробегает белый блик", S::disc_glow_on());
+    S::set_disc_glow_on(glow);
+    let focus = toggle(
+        ui,
+        &mut ry,
+        "Громче тот, на который смотришь",
+        "Когда рядом играют несколько пластинок, та, на которую смотришь, звучит громко, остальные — тихо",
+        S::disc_focus_on(),
+    );
+    S::set_disc_focus_on(focus);
+    let solo = toggle(
+        ui,
+        &mut ry,
+        "Слушать только закреплённую",
+        "Музыка с пластинок не слышна, пока не закрепите проигрыватель клавишей «Закрепить пластинку» (вкладка «Клавиши»); слышно только его",
+        S::pin_solo_on(),
+    );
+    S::set_pin_solo_on(solo);
     page_scroll(ui, x, y, w, ry);
 }
 
@@ -1812,6 +2181,395 @@ fn info_row(ui: &mut Ui, x: i32, ry: i32, w: i32, title: &str, value: &str, colo
     ui.tooltip(x, ry, w - 24, 20, tip);
 }
 
+/// Вкладка «Группы»: группы Plasmo Voice из аддона сервера pv-addon-groups (`groups.rs`). Список мод
+/// получает сам, кнопки отправляют команды аддона, а где нужен ввод (название, пароль) — открывается чат.
+fn page_groups(ui: &mut Ui, x: i32, y: i32, w: i32) {
+    let mut ry = y;
+    if !S::server_has_groups() {
+        heading(ui, x, w, "Группы", ry - 1);
+        centered(ui, x, w, "На этом сервере нет групп голосового чата.", ry + 22, DIM);
+        let hint = if S::protocol().starts_with("Plasmo") {
+            "Группы Plasmo Voice даёт аддон сервера pv-addon-groups."
+        } else {
+            "Группы выключены в настройках Simple Voice Chat на сервере."
+        };
+        centered(ui, x, w, hint, ry + 36, 0x6E6E6E);
+        page_scroll(ui, x, y, w, ry + 50);
+        return;
+    }
+    // Plasmo: список спрашиваем командой; SVC: сервер присылает группы сам
+    let loading = crate::groups::loading();
+    heading(ui, x, w, "Группы на сервере", ry - 1);
+    if crate::groups::needs_refresh() {
+        crate::groups::refresh_if_older(Duration::from_secs(15));
+        let bw = 64;
+        if ui.button(x + w - bw, ry - 5, bw, 16, if loading { "Обновляю…" } else { "Обновить" }) {
+            crate::groups::refresh();
+        }
+    }
+    ry += 18;
+
+    // приглашение, если есть: те же «Принять» / «Отказаться», что на плашке в игре
+    if let Some((text, gname, _)) = crate::groups::pending_invite() {
+        let ch = 30;
+        ui.frame(x, ry, w, ch, RUST, 0xFF1A_1024);
+        ui.icon(&icons::TAB_GROUPS, x + 6, ry + 6, 1);
+        let line = invite_line(&text, gname.as_deref());
+        ui.text(&fit(&line, w - 18 - 150), x + 18, ry + 5, TEXT);
+        ui.text("Вас приглашают в группу", x + 18, ry + 17, DIM);
+        if ui.button(x + w - 146, ry + 7, 70, 16, "Принять") {
+            crate::groups::accept_invite();
+        }
+        if ui.button(x + w - 72, ry + 7, 66, 16, "Отказаться") {
+            crate::groups::decline_invite();
+        }
+        ry += ch + 6;
+    }
+
+    // ваша группа
+    let mine = crate::groups::mine();
+    let card_h = 30;
+    ui.frame(x, ry, w, card_h, if mine.is_some() { RUST } else { OUTLINE }, P_DEEP);
+    ui.icon(if mine.is_some() { &icons::TAB_GROUPS } else { &icons::TAB_GROUPS_OFF }, x + 6, ry + 6, 1);
+    match &mine {
+        Some(g) => {
+            let lw = text_width("Вы в группе") + 4;
+            ui.text("Вы в группе", x + 18, ry + 5, DIM);
+            ui.text(&fit(&g.name, w - 18 - lw - 64), x + 18 + lw, ry + 5, TEXT);
+            // кто в группе: головы и ники (сервер Plasmo не перечисляет того, кто спрашивает, — себя добавляем)
+            let mut who = g.members.clone();
+            let me = S::self_name();
+            if !me.is_empty() && !who.iter().any(|m| m.eq_ignore_ascii_case(&me)) {
+                who.insert(0, me);
+            }
+            let hw = member_heads(ui, x + 18, ry + 17, &who, 8, 10);
+            let names = if who.is_empty() { g.info.clone() } else { who.join(", ") };
+            ui.text(&fit(&names, w - 18 - hw - 4 - 64), x + 18 + hw + 4, ry + 17, 0x8A8A8A);
+            if !g.members.is_empty() {
+                ui.tooltip(x, ry, w - 60, card_h, &g.members.join(", "));
+            }
+            if ui.button(x + w - 56, ry + 7, 50, 16, "Выйти") {
+                crate::groups::leave();
+            }
+        }
+        None => {
+            ui.text("Вы не в группе.", x + 18, ry + 5, TEXT);
+            ui.text("Войдите в группу из списка или создайте свою.", x + 18, ry + 17, 0x8A8A8A);
+        }
+    }
+    ry += card_h + 8;
+
+    // группы, в которые можно войти; поиск — по названию группы или по нику того, кто в ней
+    let all_others: Vec<crate::groups::Group> = crate::groups::list().into_iter().filter(|g| !g.mine).collect();
+    let (focus, join_id, find) = {
+        let st = lock();
+        (st.group_field, st.join_id.clone(), st.group_find.clone())
+    };
+    let mut clicked_field = false;
+    if !all_others.is_empty() || !find.is_empty() {
+        if search_input(ui, x, ry, w, &find, "Найти группу или игрока в ней…", focus == Some(GroupField::Find)) {
+            lock().group_field = Some(GroupField::Find);
+            clicked_field = true;
+        }
+        ry += 22;
+    }
+    let needle = find.trim().to_lowercase();
+    let others: Vec<crate::groups::Group> = all_others
+        .into_iter()
+        .filter(|g| {
+            needle.is_empty()
+                || g.name.to_lowercase().contains(&needle)
+                || g.members.iter().any(|m| m.to_lowercase().contains(&needle))
+        })
+        .collect();
+    if others.is_empty() {
+        let msg = if !needle.is_empty() {
+            "Нет групп с таким названием или игроком."
+        } else if !crate::groups::fetched() {
+            "Загружаю список групп…"
+        } else {
+            "Других групп пока нет."
+        };
+        centered(ui, x, w, msg, ry + 4, DIM);
+        ry += 20;
+    }
+    for g in &others {
+        let rh = 22;
+        let open = join_id.as_deref() == Some(g.id.as_str());
+        let hot = ui.hover(x, ry, w, rh);
+        ui.fill(x, ry, w, rh, if hot || open { 0x2AFF_FFFF } else { 0x18FF_FFFF });
+        // значок: замок у группы с паролем, иначе значок группы; дальше название и головы участников
+        ui.icon(if g.locked { &icons::TAB_LOCK } else { &icons::TAB_GROUPS }, x + 6, ry + 7, 1);
+        let tx = x + 18;
+        let bw = 58;
+        let name = fit(&g.name, w / 3);
+        let nw = text_width(&name);
+        ui.text(&name, tx, ry + 7, TEXT);
+        let hx = tx + nw + 8;
+        let hw = member_heads(ui, hx, ry + 7, &g.members, 8, 8);
+        if g.members.is_empty() {
+            ui.text(&fit(&g.info, w - (hx - x) - bw - 12), hx, ry + 7, 0x8A8A8A);
+        } else {
+            let n = g.members.len();
+            let count = format!("{n}");
+            ui.text(&count, hx + hw + 4, ry + 7, 0x8A8A8A);
+        }
+        if !g.members.is_empty() {
+            ui.tooltip(x, ry, w - bw - 8, rh, &g.members.join(", "));
+        }
+        if ui.button(x + w - bw - 4, ry + 3, bw, 16, "Войти") {
+            if g.locked {
+                let mut st = lock();
+                st.join_id = if open { None } else { Some(g.id.clone()) };
+                st.join_pass.clear();
+                st.group_field = if open { None } else { Some(GroupField::Join) };
+                clicked_field = true;
+            } else {
+                crate::groups::join(g, "");
+            }
+        }
+        if g.locked {
+            ui.tooltip(x + w - bw - 4, ry + 3, bw, 16, "Группа с паролем");
+        }
+        ry += rh + 2;
+        if open {
+            // пароль для этой группы
+            let pass = lock().join_pass.clone();
+            let fw = w - 70;
+            if group_input(ui, x, ry, fw, &pass, "Пароль группы", focus == Some(GroupField::Join), true) {
+                lock().group_field = Some(GroupField::Join);
+                clicked_field = true;
+            }
+            if ui.button(x + fw + 4, ry + 1, w - fw - 4, 16, "Войти") {
+                let mut st = lock();
+                submit_group_field(&mut st, GroupField::Join);
+            }
+            ry += 22;
+        }
+    }
+    ry += 6;
+
+    // создать свою
+    heading(ui, x, w, "Создать группу", ry);
+    ry += 14;
+    let (gname, gpass) = {
+        let st = lock();
+        (st.group_name.clone(), st.group_pass.clone())
+    };
+    let bw = 70;
+    let fw = (w - bw - 8) / 2;
+    if group_input(ui, x, ry, fw, &gname, "Название", focus == Some(GroupField::Name), false) {
+        lock().group_field = Some(GroupField::Name);
+        clicked_field = true;
+    }
+    if group_input(ui, x + fw + 4, ry, fw, &gpass, "Пароль (необязательно)", focus == Some(GroupField::Pass), true) {
+        lock().group_field = Some(GroupField::Pass);
+        clicked_field = true;
+    }
+    if ui.button(x + w - bw, ry + 1, bw, 16, "Создать") {
+        let mut st = lock();
+        submit_group_field(&mut st, GroupField::Name);
+    }
+    ry += 20;
+    if crate::groups::has_kinds() {
+        use crate::svc::GroupKind;
+        let kinds = [
+            (GroupKind::Normal, "Обычная", "«Группы» — группе, «Локальный» — только рядом; пока говорите рядом, группу не слышно. Если вы в группе один, голос идёт только группе"),
+            (GroupKind::Open, "Открытая", "Вас слышит группа и те, кто рядом; вы слышите всех"),
+            (GroupKind::Isolated, "Изолированная", "Только группа: ни вас, ни вам — никого рядом"),
+        ];
+        let cur = lock().group_kind;
+        let kw = (w - 8) / 3;
+        for (i, (k, label, tip)) in kinds.into_iter().enumerate() {
+            let bx = x + i as i32 * (kw + 4);
+            let sel = cur == k;
+            let bg = if sel { BTN_SEL } else { ui.shade(bx, ry, kw, 16, 0xFF24_2424, BTN_HOVER) };
+            ui.vbox(bx, ry, kw, 16, if sel { ACCENT } else { BLACK }, bg);
+            ui.text(label, bx + (kw - text_width(label)) / 2, ry + 4, TEXT);
+            ui.tooltip(bx, ry, kw, 16, tip);
+            if ui.clicked(bx, ry, kw, 16) {
+                lock().group_kind = k;
+                ui.changed = true;
+            }
+        }
+        ry += 20;
+    }
+    ry += 2;
+    // ответ сервера на последнюю кнопку
+    if let Some(msg) = crate::groups::status() {
+        ui.fill(x, ry, w, 16, 0x30A8_55F7);
+        centered(ui, x, w, &fit(&msg, w - 8), ry + 4, TEXT);
+        ry += 22;
+    }
+
+    // приглашения (только Plasmo: у Simple Voice Chat их нет): от кого показывать
+    if crate::groups::can_invite() {
+        use crate::settings::InviteMode;
+        heading(ui, x, w, "Приглашения", ry);
+        ry += 14;
+        let modes = [
+            (InviteMode::AllExcept, "От всех, кроме", "Показывать приглашения от всех, кроме отмеченных ниже"),
+            (InviteMode::OnlyFrom, "Только от", "Показывать приглашения только от отмеченных ниже"),
+            (InviteMode::Nobody, "Ни от кого", "Не показывать приглашения вовсе (и в чат они не пишутся)"),
+        ];
+        let cur = S::invite_mode();
+        let kw = (w - 8) / 3;
+        for (i, (m, label, tip)) in modes.into_iter().enumerate() {
+            let bx = x + i as i32 * (kw + 4);
+            let sel = cur == m;
+            let bg = if sel { BTN_SEL } else { ui.shade(bx, ry, kw, 16, 0xFF24_2424, BTN_HOVER) };
+            ui.vbox(bx, ry, kw, 16, if sel { ACCENT } else { BLACK }, bg);
+            ui.text(label, bx + (kw - text_width(label)) / 2, ry + 4, TEXT);
+            ui.tooltip(bx, ry, kw, 16, tip);
+            if ui.clicked(bx, ry, kw, 16) {
+                S::set_invite_mode(m);
+                ui.changed = true;
+            }
+        }
+        ry += 20;
+        if cur != InviteMode::Nobody {
+            // игроки с голосом рядом и все уже отмеченные: отметка — «не принимать» или «принимать»
+            let only = cur == InviteMode::OnlyFrom;
+            let marked = if only { S::invite_allowed() } else { S::invite_blocked() };
+            let me = S::self_name().to_lowercase();
+            let mut nicks: Vec<String> = roster::menu_players().into_iter().map(|p| p.nick).filter(|n| n.to_lowercase() != me).collect();
+            for m in &marked {
+                if !nicks.iter().any(|n| n.to_lowercase() == *m) {
+                    nicks.push(m.clone());
+                }
+            }
+            if nicks.is_empty() {
+                centered(ui, x, w, "Рядом нет игроков с голосовым чатом.", ry + 2, DIM);
+                ry += 16;
+            } else {
+                ui.text(if only { "Отметьте, от кого принимать:" } else { "Отметьте, от кого не принимать:" }, x, ry + 2, DIM);
+                ry += 14;
+            }
+            for n in nicks.into_iter().take(16) {
+                let rh = 18;
+                match faces::skin(&n) {
+                    Some(skin) => ui.face(&skin, x + 4, ry + 1, 16),
+                    None => ui.fill(x + 4, ry + 1, 16, 16, 0xFF3A_3A3A),
+                }
+                let on = if only { S::is_invite_allowed(&n) } else { S::is_invite_blocked(&n) };
+                let v = ui.toggle(x + 26, ry + 1, w - 26, &fit(&n, w - 80), on);
+                if v != on {
+                    if only {
+                        S::set_invite_allowed(&n, v);
+                    } else {
+                        S::set_invite_blocked(&n, v);
+                    }
+                    ui.changed = true;
+                }
+                ry += rh;
+            }
+        }
+        ry += 6;
+    }
+
+    // позвать игроков в свою группу
+    if let Some(g) = mine.as_ref().filter(|_| crate::groups::can_invite()) {
+        heading(ui, x, w, "Позвать в группу", ry);
+        ry += 16;
+        // в группе уже: участники из подсказки сервера и вы сами (сервер не перечисляет того, кто спрашивает)
+        let mut lower: Vec<String> = g.members.iter().map(|m| m.to_lowercase()).collect();
+        lower.push(S::self_name().to_lowercase());
+        let all_free: Vec<roster::MenuPlayer> =
+            roster::menu_players().into_iter().filter(|p| !lower.contains(&p.nick.to_lowercase())).collect();
+        let ifind = lock().invite_find.clone();
+        if !all_free.is_empty() || !ifind.is_empty() {
+            if search_input(ui, x, ry, w, &ifind, "Найти игрока…", focus == Some(GroupField::Invite)) {
+                lock().group_field = Some(GroupField::Invite);
+                clicked_field = true;
+            }
+            ry += 22;
+        }
+        let ineedle = ifind.trim().to_lowercase();
+        let free: Vec<roster::MenuPlayer> =
+            all_free.into_iter().filter(|p| ineedle.is_empty() || p.nick.to_lowercase().contains(&ineedle)).take(10).collect();
+        if free.is_empty() {
+            let msg = if ineedle.is_empty() { "Рядом нет игроков с голосовым чатом, кого можно позвать." } else { "Игроков с таким ником нет." };
+            centered(ui, x, w, msg, ry + 2, DIM);
+            ry += 16;
+        }
+        for p in &free {
+            let rh = 20;
+            ui.fill(x, ry, w, rh - 2, if ui.hover(x, ry, w, rh - 2) { 0x2AFF_FFFF } else { 0x12FF_FFFF });
+            match faces::skin(&p.nick) {
+                Some(skin) => ui.face(&skin, x + 4, ry + 1, 16),
+                None => ui.fill(x + 4, ry + 1, 16, 16, 0xFF3A_3A3A),
+            }
+            ui.text(&fit(&p.nick, w - 96), x + 26, ry + 5, TEXT);
+            if ui.button(x + w - 64, ry + 1, 60, 16, "Позвать") {
+                crate::groups::invite(&p.nick);
+            }
+            ry += rh;
+        }
+    }
+    // клик мимо полей снимает фокус (сам клик достанется тому, что под курсором)
+    if ui.pressed && !clicked_field {
+        lock().group_field = None;
+    }
+    page_scroll(ui, x, y, w, ry + 4);
+}
+
+/// Головы участников группы в ряд (`size`×`size`, кратно 8 — пиксели скина остаются чёткими; до `max`,
+/// дальше «+N»). Возвращает ширину ряда.
+fn member_heads(ui: &mut Ui, x: i32, y: i32, members: &[String], size: i32, max: usize) -> i32 {
+    let mut cx = x;
+    for m in members.iter().take(max) {
+        match faces::skin(m) {
+            Some(skin) => ui.face(&skin, cx, y, size),
+            None => ui.fill(cx, y, size, size, 0xFF3A_3A3A),
+        }
+        ui.tooltip(cx, y, size, size, m);
+        cx += size + 1;
+    }
+    if members.len() > max {
+        let more = format!("+{}", members.len() - max);
+        ui.text(&more, cx + 2, y + (size - 8) / 2, 0x8A8A8A);
+        cx += text_width(&more) + 3;
+    }
+    (cx - x - 1).max(0)
+}
+
+/// Строка поиска вкладки «Группы»: лупа слева, как у поиска игроков во «Громкости». true — по ней щёлкнули.
+fn search_input(ui: &mut Ui, x: i32, y: i32, w: i32, value: &str, hint: &str, focus: bool) -> bool {
+    let clicked = group_input(ui, x, y, w, &format!("     {value}"), "", focus, false);
+    ui.icon(&LENS, x + 4, y + 5, 1);
+    if value.is_empty() && !focus {
+        ui.text(&fit(hint, w - 24), x + 17, y + 5, 0x6E6E6E);
+    }
+    clicked
+}
+
+/// Поле ввода вкладки «Группы»: тёмное, с подсказкой и мигающим курсором в фокусе; пароль — точками.
+/// true — по полю щёлкнули.
+#[allow(clippy::too_many_arguments)]
+fn group_input(ui: &mut Ui, x: i32, y: i32, w: i32, value: &str, hint: &str, focus: bool, secret: bool) -> bool {
+    let h = 18;
+    let t = ui.ease(akey(30, x, y), 0.0, if focus { 1.0 } else { 0.0 }, 14.0);
+    ui.frame(x, y, w, h, lerp_argb(OUTLINE, RUST, t), P_DEEP);
+    let shown: String = if secret { "•".repeat(value.chars().count()) } else { value.to_string() };
+    // длинный текст: видно конец, где курсор
+    let mut vis = shown.as_str();
+    while text_width(vis) > w - 10 && !vis.is_empty() {
+        let mut it = vis.chars();
+        it.next();
+        vis = it.as_str();
+    }
+    if value.is_empty() && !focus {
+        ui.text(&fit(hint, w - 8), x + 4, y + 5, 0x6E6E6E);
+    } else {
+        ui.text(vis, x + 4, y + 5, TEXT);
+    }
+    if focus && ui.blink {
+        let cx = x + 4 + if vis.is_empty() { 0 } else { text_width(vis) + 1 };
+        ui.fill(cx, y + 13, 5, 1, WHITE);
+    }
+    ui.clicked(x, y, w, h)
+}
+
 /// Прокрутка длинной страницы: сколько можно прокрутить и полоса справа (как у «Устройств»).
 fn page_scroll(ui: &mut Ui, x: i32, y: i32, w: i32, bottom: i32) {
     let content = bottom - y;
@@ -1863,21 +2621,36 @@ fn page_controls(ui: &mut Ui, x: i32, y: i32, w: i32) {
 
     section(ui, &mut ry, "Рация");
     let acts = S::server_activations();
+    let mut hidden = false;
     for slot in 0..S::PTT_SLOTS {
-        // подпись: какая активация сейчас на этом слоте
+        // подпись: какая активация сейчас на этом слоте. Лишние рации (на сервере нет второй и третьей
+        // активации, например «Группы») не показываем: их клавиши ничего бы не делали.
         let name = if slot == 0 {
             Some("Локальный".to_string())
         } else {
             acts.iter().filter(|a| a.name != S::PROXIMITY).nth(slot - 1).map(activation_title)
         };
+        let Some(n) = name else {
+            hidden = true;
+            continue;
+        };
         if ui.vis(ry, 20) {
-            let title = match &name {
-                Some(n) => format!("Рация «{n}»"),
-                None => format!("Рация {}", slot + 1),
-            };
-            slot_key_row(ui, x, ry, w, &title, slot, "Говорите, пока зажата (если у активации тип «По клавише»)");
+            slot_key_row(ui, x, ry, w, &format!("Рация «{n}»"), slot, "Говорите, пока зажата (если у активации тип «По клавише»)");
         }
         ry += DEV_ROW;
+    }
+    if hidden {
+        // у SVC рации свои: «Локальный» вне группы и «Группы» в группе
+        let (a, b) = if S::protocol().contains("Simple Voice Chat") {
+            ("В обычной группе: «Группы» — группе, «Локальный» — рядом", "(если вы в группе один — только группе).")
+        } else {
+            ("Отдельные рации для групп и других активаций появятся,", "если сервер их поддерживает.")
+        };
+        if ui.vis(ry, 10) {
+            ui.text(a, x, ry, DIM);
+            ui.text(b, x, ry + 11, DIM);
+        }
+        ry += 24;
     }
     ry += 6;
 
@@ -1888,6 +2661,15 @@ fn page_controls(ui: &mut Ui, x: i32, y: i32, w: i32) {
     section(ui, &mut ry, "Дистанция голоса «Локальный»");
     action(ui, &mut ry, "dist_up", "Следующая дистанция из разрешённых сервером");
     action(ui, &mut ry, "dist_down", "Предыдущая дистанция из разрешённых сервером");
+    ry += 6;
+
+    section(ui, &mut ry, "Пластинки");
+    action(
+        ui,
+        &mut ry,
+        "pin_disc",
+        "Смотрите на проигрыватель и нажмите: он звучит громко, куда бы вы ни смотрели. Ещё раз — снять",
+    );
     ry += 6;
 
     section(ui, &mut ry, "Команды в чате");
@@ -1919,6 +2701,171 @@ fn page_status(ui: &mut Ui, x: i32, y: i32, w: i32) {
         }
         *ry += 14;
     };
+
+    section(ui, &mut ry, "Микрофон: тонкая настройка");
+    let rx = x + w - 20;
+    // шумоподавление
+    if ui.vis(ry, 20) {
+        let (cx, cw) = dev_row(ui, x, ry, w, "Сила шумоподавления");
+        let np = S::noise_pct();
+        let t = if np == 0 { "Выкл".to_string() } else { format!("{np}%") };
+        if let Some(v) = ui.mc_slider(4, cx, ry, cw, 20, np as f32 / 100.0, &t, TEXT) {
+            S::set_noise_pct((v * 100.0).round() as u32);
+        }
+        let tip = if S::noise_ai() {
+            "Нейросеть RNNoise (как в Plasmo Voice): убирает и ровный шум, и клавиатуру, щелчки, шорох. Меньше 100% — подмешивает исходный звук"
+        } else {
+            "Своё спектральное: убирает ровный шум (кулер, улица). Сильнее — чище, но голос «плоский»"
+        };
+        ui.tooltip(x, ry, cx - x, 20, tip);
+        if ui.reset_button(rx, ry, np != 0, "Выключить") {
+            S::set_noise_pct(0);
+            ui.changed = true;
+        }
+    }
+    ry += DEV_ROW;
+
+    // какой шумодав: нейросеть или своё спектральное
+    if ui.vis(ry, 20) {
+        let v = onoff_row(
+            ui,
+            x,
+            ry,
+            w,
+            "Шумодав-нейросеть",
+            "RNNoise, как в Plasmo Voice: лучше с клавиатурой и щелчками. Выключено — своё спектральное (можно запомнить шум)",
+            S::noise_ai(),
+            true,
+            true,
+        );
+        if v != S::noise_ai() {
+            S::set_noise_ai(v);
+            ui.changed = true;
+        }
+    }
+    ry += DEV_ROW;
+
+    // «Запомнить шум»: 3 секунды тишины, и шумодав точно знает ваш кулер (только у своего шумодава)
+    if !S::noise_ai() {
+        if ui.vis(ry, 20) {
+            let (cx, cw) = dev_row(ui, x, ry, w, "Запомнить шум");
+            ui.tooltip(x, ry, cx - x, 20, "Помолчите 3 секунды: шумодав запомнит ваш фон и не будет глушить долгую речь");
+            let learned = S::noise_profile().is_some();
+            match S::learn_progress() {
+                Some(p) => {
+                    // идёт запись: полоса прогресса, просим молчать
+                    ui.frame(cx, ry, cw, 20, RUST, P_DEEP);
+                    let fw = ((cw - 2) as f32 * p) as i32;
+                    if fw > 0 {
+                        ui.fill(cx + 1, ry + 1, fw, 18, RUST_DK);
+                    }
+                    let left = ((1.0 - p) * crate::denoise::LEARN_SECS).max(0.0);
+                    let t = format!("Молчите… {left:.1} с");
+                    ui.text(&t, cx + (cw - text_width(&t)) / 2, ry + 6, TEXT);
+                }
+                None => {
+                    let label = if learned { "Запомнен ✓ (ещё раз)" } else { "Записать 3 с тишины" };
+                    let can = S::connected() && S::mic_ok();
+                    let hot = if can { ui.hot(18, cx, ry, cw, 20) } else { 0.0 };
+                    ui.vbtn(cx, ry, cw, 20, BTN, BTN_HOVER, hot, if can { 1.0 } else { 0.5 });
+                    ui.text(&fit(label, cw - 8), cx + (cw - text_width(&fit(label, cw - 8))) / 2, ry + 6, if learned { OK } else { TEXT });
+                    if !can {
+                        ui.tooltip(cx, ry, cw, 20, "Нужно подключение к голосу и микрофон");
+                    } else if ui.clicked(cx, ry, cw, 20) {
+                        S::request_noise_learn();
+                    }
+                }
+            }
+            if ui.reset_button(rx, ry, learned && S::learn_progress().is_none(), "Забыть шум") {
+                S::set_noise_profile(None);
+                S::save_noise_profile();
+            }
+        }
+        ry += DEV_ROW;
+    }
+
+    if ui.vis(ry, 20) {
+        let v = onoff_row(ui, x, ry, w, "Фильтр гула", "Срезает всё ниже 80 Гц: гул, вентилятор, стук по столу. Голос не трогает", S::hum_filter(), true, true);
+        S::set_hum_filter(v);
+    }
+    ry += DEV_ROW;
+
+    if ui.vis(ry, 20) {
+        let v = onoff_row(
+            ui,
+            x,
+            ry,
+            w,
+            "Автогромкость",
+            "Тихий голос подтягивается сам, громкий смех не хрипит. Подстраивается только пока вы говорите",
+            S::agc_on(),
+            false,
+            true,
+        );
+        S::set_agc_on(v);
+    }
+    ry += DEV_ROW;
+
+    ry += 6;
+
+    section(ui, &mut ry, "Объёмный звук: тонкая настройка");
+    if ui.vis(ry, 20) {
+        let v = onoff_row(
+            ui,
+            x,
+            ry,
+            w,
+            "Заглушение через блоки",
+            "За стеной голос не только тише, но и глуше, как в жизни. Стекло звук пропускает",
+            S::occlusion_on(),
+            true,
+            true,
+        );
+        S::set_occlusion_on(v);
+    }
+    ry += DEV_ROW;
+
+    if ui.vis(ry, 20) {
+        let v = onoff_row(
+            ui,
+            x,
+            ry,
+            w,
+            "Звук огибает углы",
+            "Голос из-за стены идёт в обход: через двери, окна и проёмы, и слышно его со стороны проёма",
+            S::routes_on(),
+            true,
+            S::occlusion_on(),
+        );
+        S::set_routes_on(v);
+    }
+    ry += DEV_ROW;
+
+    let stereo = S::out_stereo() || !S::connected();
+    if ui.vis(ry, 20) {
+        let tip = if stereo { "Голос слышно с той стороны, где стоит игрок" } else { "Устройство вывода моно: направление не слышно" };
+        let v = onoff_row(ui, x, ry, w, "Направленные источники", tip, S::directional_on(), true, stereo);
+        S::set_directional_on(v);
+    }
+    ry += DEV_ROW;
+
+    if ui.vis(ry, 20) {
+        let ok = stereo && S::directional_on();
+        let v = onoff_row(
+            ui,
+            x,
+            ry,
+            w,
+            "HRTF",
+            "360° в наушниках: голос проходит через записанные отклики ушей (KEMAR, MIT) — слышно не только слева-справа, но и спереди-сзади, сверху-снизу",
+            S::hrtf_on(),
+            true,
+            ok,
+        );
+        S::set_hrtf_on(v);
+    }
+    ry += DEV_ROW;
+    ry += 6;
 
     section(ui, &mut ry, "Визуальные и интерфейс");
     if ui.vis(ry, 20) {
@@ -1972,16 +2919,11 @@ fn page_status(ui: &mut Ui, x: i32, y: i32, w: i32) {
         };
         info_row(ui, x, ry, w, "Вывод звука", out, color, "Направленный звук и HRTF работают только в стерео");
     }
-    ry += DEV_ROW;
-    if ui.vis(ry, 20) {
-        let n = ROUTED_COUNT.load(std::sync::atomic::Ordering::Relaxed);
-        info_row(ui, x, ry, w, "Слышно в обход стен", &n.to_string(), TEXT, "Сколько игроков сейчас слышно через двери и проёмы");
-    }
     ry += DEV_ROW + 6;
 
     section(ui, &mut ry, "Состояние");
     let proto = S::protocol();
-    let rows: [(&str, String, u32, &str); 5] = [
+    let rows: [(&str, String, u32, &str); 4] = [
         ("Подключение к голосу", yes_no(S::connected()).0.to_string(), yes_no(S::connected()).1, "Сервер принял ваш голосовой клиент"),
         (
             "Протокол",
@@ -1991,7 +2933,6 @@ fn page_status(ui: &mut Ui, x: i32, y: i32, w: i32) {
         ),
         ("Микрофон", yes_no(S::mic_ok()).0.to_string(), yes_no(S::mic_ok()).1, "Микрофон открылся"),
         ("Дистанция «Локальный»", if S::distance() > 0 { S::distance().to_string() } else { "—".to_string() }, TEXT, "Сменить: вкладка «Активации»"),
-        ("Слышно источников", S::hearing().to_string(), TEXT, "Сколько голосов играет прямо сейчас"),
     ];
     for (title, value, color, tip) in rows.iter() {
         if ui.vis(ry, 20) {
@@ -2006,6 +2947,7 @@ fn page_status(ui: &mut Ui, x: i32, y: i32, w: i32) {
             S::reset_sliders();
             S::set_push_to_talk(false);
             S::set_overlay_on(true);
+            S::set_hotbar_icon_on(true);
             S::set_overlay_labels(true);
             S::set_overlay_corner(1);
             S::set_mic_muted(false);
@@ -2077,14 +3019,23 @@ fn window(ui: &mut Ui, gw: i32, gh: i32, tab: Tab) -> Tab {
         ui.fill(sa, hy + hh - 1, sb - sa, 1, mul_alpha(RUST, 0.75));
     }
 
-    // значок Plasmo: чуть покачивается, раз в несколько секунд по нему пробегает блик
+    // значок: чуть покачивается, раз в несколько секунд по нему пробегает блик. Это ещё и монетка: щелчок —
+    // звон золотой монеты и подпрыгивание, много щелчков подряд — монетка переворачивается.
     let mut logo = Fx::NONE;
     logo.dy = 0.5 * (secs * 2.2).sin();
     let g = (ms % 4200.0) / 1000.0;
     if g < 1.0 {
         logo.glint = g;
     }
-    ui.icon_fx(&icons::LOGO, 8, hy + 5, 2, logo);
+    let (lx, ly, lsz) = (8, hy + 5, icons::LOGO.w as i32 * 2);
+    if ui.clicked(lx - 2, ly - 2, lsz + 4, lsz + 4) {
+        coin_click();
+    }
+    coin_fx(&mut logo);
+    ui.icon_fx(&icons::LOGO, lx, ly, 2, logo);
+    if let Ok(mut at) = LOGO_AT.lock() {
+        *at = (lx, ly + lsz);
+    }
     let tx0 = 8 + 18;
     ui.text("Rust", tx0, hy + 9, RUST_TEXT);
     ui.text("Voice", tx0 + text_width("Rust "), hy + 9, TEXT);
@@ -2208,7 +3159,7 @@ fn window(ui: &mut Ui, gw: i32, gh: i32, tab: Tab) -> Tab {
     let (cx, cy) = (col_x + dx, hh + 12 + rise);
     ui.clip = (hh + 6, gh - 4);
     match tab {
-        Tab::Devices | Tab::Activation | Tab::Status | Tab::Controls | Tab::Overlay => {
+        Tab::Devices | Tab::Activation | Tab::Status | Tab::Controls | Tab::Overlay | Tab::Groups => {
             let scroll = {
                 let mut st = lock();
                 st.dev_scroll = st.dev_scroll.clamp(0.0, st.dev_max);
@@ -2224,6 +3175,7 @@ fn window(ui: &mut Ui, gw: i32, gh: i32, tab: Tab) -> Tab {
                 Tab::Activation => page_activation(ui, cx, cy - scroll, cw),
                 Tab::Status => page_status(ui, cx, cy - scroll, cw),
                 Tab::Overlay => page_overlay(ui, cx, cy - scroll, cw),
+                Tab::Groups => page_groups(ui, cx, cy - scroll, cw),
                 _ => page_controls(ui, cx, cy - scroll, cw),
             }
         }
@@ -2273,14 +3225,31 @@ pub fn draw(c: &mut dyn Canvas, mouse: (i32, i32)) {
         clip: (0, gh),
     };
     let new_tab = window(&mut ui, gw, gh, tab);
+    draw_thanks(&mut ui, gw);
 
     // Подсказка у курсора.
     if let Some(tip) = ui.tip.take() {
-        let tw = text_width(&tip) + 8;
+        // длинная подсказка переносится по словам, чтобы не уйти за край экрана
+        let max_w = (gw - 12).clamp(60, 260);
+        let mut lines: Vec<String> = Vec::new();
+        for word in tip.split(' ') {
+            match lines.last_mut() {
+                Some(l) if text_width(&format!("{l} {word}")) <= max_w => {
+                    l.push(' ');
+                    l.push_str(word);
+                }
+                _ => lines.push(word.to_string()),
+            }
+        }
+        // запас на неточную оценку ширины (кириллица, кавычки)
+        let tw = lines.iter().map(|l| text_width(l)).max().unwrap_or(0) + 12;
+        let th = lines.len() as i32 * 10 + 4;
         let tx = (mouse.0 + 10).min(gw - tw - 2).max(2);
-        let ty = (mouse.1 + 12).min(gh - 16).max(2);
-        ui.frame(tx, ty, tw, 14, 0xFF3C_1E78, 0xF010_0010);
-        ui.text(&tip, tx + 4, ty + 3, TEXT);
+        let ty = (mouse.1 + 12).min(gh - th - 2).max(2);
+        ui.frame(tx, ty, tw, th, 0xFF3C_1E78, 0xF010_0010);
+        for (i, l) in lines.iter().enumerate() {
+            ui.text(l, tx + 4, ty + 3 + i as i32 * 10, TEXT);
+        }
     }
     let (changed, active_now, anim, ind_x, ind_w) = (ui.changed, ui.active, std::mem::take(&mut ui.anim), ui.ind_x, ui.ind_w);
 
@@ -2555,37 +3524,216 @@ fn talk_list(c: &mut dyn Canvas, list: &[roster::MenuPlayer], corner: u8, skip: 
     h
 }
 
-/// Подсказка над хотбаром после клавиш действий («Микрофон выключен», «Дистанция: 32»).
+/// Плашка пластинки вместо жёлтой строки pv-addon-discs: крутящийся диск и «Загружаем…», «Сейчас играет» с
+/// названием или «Трек не найден». Стиль — как у таблички над проигрывателем.
+pub fn draw_disc_toast(c: &mut dyn Canvas, gw: i32, gh: i32) {
+    use crate::notes::DiscNote;
+    let Some((note, age)) = crate::notes::disc_toast() else { return };
+    let a = (age / 0.12).min(1.0) * ((crate::notes::DISC_TOAST_FOR - age) / 0.5).clamp(0.0, 1.0);
+    if a <= 0.01 {
+        return;
+    }
+    let k = |argb: u32| mul_alpha(argb, a);
+    let (head, rest, accent) = match &note {
+        DiscNote::Loading => (crate::i18n::tr("Загружаем…").into_owned(), None, 0xFFA8_55F7),
+        DiscNote::Playing(t) => (crate::i18n::tr("Сейчас играет").into_owned(), Some(fit(t, 140)), 0xFFA8_55F7),
+        DiscNote::NotFound(t) => (crate::i18n::tr("Трек не найден").into_owned(), Some(fit(t, 120)), 0xFFE5_484D),
+    };
+    let (pad, disc) = (5, 9);
+    let tw = text_width(&head) + rest.as_ref().map_or(0, |r| text_width(r) + 6);
+    let w = pad + disc + 5 + tw + pad;
+    let h = 15;
+    let slide = ((1.0 - (age / 0.18).min(1.0)) * 4.0) as i32;
+    let (x, y) = (gw / 2 - w / 2, gh - 74 + slide);
+    rounded(c, x, y, w, h, k(0xE014_0A20));
+    c.fill(x + 1, y, w - 2, 1, k(accent));
+    c.fill(x + 1, y + h - 1, w - 2, 1, k(0x807E_3BC4));
+    // пластинка (как на табличке), по дорожке бежит блик; пока грузится — быстрее
+    let (dx, dy) = (x + pad, y + 3);
+    for (row, line) in crate::notes::DISC.iter().enumerate() {
+        for (col, ch) in line.bytes().enumerate() {
+            let col_argb = match ch {
+                b'#' => 0xFF1C_1C22,
+                b'=' => 0xFF3A_3A44,
+                b'o' => accent,
+                _ => continue,
+            };
+            c.fill(dx + col as i32, dy + row as i32, 1, 1, k(col_argb));
+        }
+    }
+    let speed = if note == DiscNote::Loading { 2.2 } else { 0.8 };
+    let ang = age * std::f32::consts::TAU * speed;
+    c.fill(dx + 4 + (ang.cos() * 3.0).round() as i32, dy + 4 + (ang.sin() * 3.0).round() as i32, 1, 1, k(0xFFE4_E4EC));
+    let tx = dx + disc + 5;
+    c.text(&head, tx, y + 4, k(TEXT), true);
+    if let Some(r) = rest {
+        let col = if matches!(note, DiscNote::NotFound(_)) { 0xFFFF_9A9A } else { 0xFFC7_9BFF };
+        c.text(&r, tx + text_width(&head) + 6, y + 4, k(col), true);
+    }
+}
+
+/// Плашка закрепления пластинки над хотбаром: замочек защёлкивается (или открывается) и слово,
+/// фиолетовая рамка как у таблички над проигрывателем. Выезжает снизу и плавно гаснет.
+pub fn draw_pin_toast(c: &mut dyn Canvas, gw: i32, gh: i32) {
+    let Some((on, _title, age)) = crate::notes::pin_toast() else { return };
+    let a = (age / 0.12).min(1.0) * ((crate::notes::PIN_TOAST_FOR - age) / 0.45).clamp(0.0, 1.0);
+    if a <= 0.01 {
+        return;
+    }
+    let k = |argb: u32| mul_alpha(argb, a);
+    let head = if on { crate::i18n::tr("Закреплено") } else { crate::i18n::tr("Откреплено") };
+    // без названия трека: коротко, только замочек и слово
+    let tw = text_width(&head);
+    let (pad, icon) = (5, 7);
+    let w = pad + icon + 5 + tw + pad;
+    let h = 15;
+    let slide = ((1.0 - (age / 0.18).min(1.0)) * 4.0) as i32;
+    // если ниже уже висит плашка пластинки — встаём над ней
+    let lift_up = if crate::notes::disc_toast().is_some() { 18 } else { 0 };
+    let (x, y) = (gw / 2 - w / 2, gh - 74 + slide - lift_up);
+    rounded(c, x, y, w, h, k(0xE014_0A20));
+    c.fill(x + 1, y, w - 2, 1, k(if on { 0xFFA8_55F7 } else { 0xFF6E_6E78 }));
+    c.fill(x + 1, y + h - 1, w - 2, 1, k(0x807E_3BC4));
+    // замочек: дужка опускается (закрыли) или поднимается и отходит правой ножкой (открыли)
+    let t = (age / 0.22).min(1.0);
+    let lift = if on { ((1.0 - t) * 2.0).round() as i32 } else { (t * 2.0).round() as i32 };
+    let col = if on { 0xFFFF_D25A } else { 0xFFB4_B4C2 };
+    let (lx, ly) = (x + pad, y + 4);
+    for (rx, ry, rw, rh, slot) in crate::notes::lock_rects(lift) {
+        c.fill(lx + rx, ly + ry, rw, rh, k(if slot { 0xFF14_0A20 } else { col }));
+    }
+    let tx = lx + icon + 5;
+    c.text(&head, tx, y + 4, k(if on { TEXT } else { 0xFFC8_C8D0 }), true);
+}
+
+/// Подсказка над хотбаром после клавиш действий («Микрофон выключен», «Посмотрите на играющий проигрыватель»):
+/// та же плашка, что у пластинок и закрепления — тёмная, с сиреневой полоской, выезжает и гаснет.
 pub fn draw_notice(c: &mut dyn Canvas, gw: i32, gh: i32) {
-    let Some((text, alpha)) = S::current_notice() else { return };
-    let a = ((alpha.clamp(0.0, 1.0) * 255.0) as u32).max(4);
-    let w = text_width(&text) + 12;
-    let (x, y) = (gw / 2 - w / 2, gh - 72);
-    c.fill(x, y, w, 14, (a * 0x60 / 255) << 24);
-    c.text(&text, gw / 2 - text_width(&text) / 2, y + 3, TEXT, true);
+    let Some((text, age)) = S::current_notice() else { return };
+    let a = (age / 0.12).min(1.0) * ((S::NOTICE_FOR - age) / 0.45).clamp(0.0, 1.0);
+    if a <= 0.01 {
+        return;
+    }
+    let k = |argb: u32| mul_alpha(argb, a);
+    let w = 6 + text_width(&text) + 6;
+    let h = 15;
+    let slide = ((1.0 - (age / 0.18).min(1.0)) * 4.0) as i32;
+    // над плашками пластинки и закрепления, если они сейчас видны
+    let mut lift = 0;
+    if crate::notes::disc_toast().is_some() {
+        lift += 18;
+    }
+    if crate::notes::pin_toast().is_some() {
+        lift += 18;
+    }
+    let (x, y) = (gw / 2 - w / 2, gh - 74 + slide - lift);
+    rounded(c, x, y, w, h, k(0xE014_0A20));
+    c.fill(x + 1, y, w - 2, 1, k(0xFFA8_55F7));
+    c.fill(x + 1, y + h - 1, w - 2, 1, k(0x807E_3BC4));
+    c.text(&text, x + 6, y + 4, k(TEXT), true);
 }
 
 /// Подсказка над прицелом после ПКМ + колесо: «ник  120%» и полоса громкости. `gw`, `gh` — размер GUI.
-pub fn draw_volume_toast(c: &mut dyn Canvas, gw: i32, gh: i32) {
+/// Название группы из текста приглашения («… в группу [название]»).
+fn bracket_name(text: &str) -> Option<String> {
+    text.rsplit_once('[').and_then(|(_, r)| r.split_once(']')).map(|(n, _)| n.trim().to_string()).filter(|n| !n.is_empty())
+}
+
+/// Текст приглашения: как прислал сервер, а если текста нет — «Приглашение в группу <название>».
+fn invite_line(text: &str, group: Option<&str>) -> String {
+    if !text.trim().is_empty() {
+        return text.trim().to_string();
+    }
+    match group {
+        Some(g) => format!("{} {g}", crate::i18n::tr("Приглашение в группу")),
+        None => crate::i18n::tr("Приглашение в группу").to_string(),
+    }
+}
+
+/// Плашка приглашения в группу сверху экрана (в игре, пока меню закрыто): текст сервера, подсказка клавиш
+/// и полоска оставшегося времени.
+pub fn draw_invite(c: &mut dyn Canvas, gw: i32, _gh: i32) {
+    let Some((text, gname, age)) = crate::groups::pending_invite() else { return };
+    // коротко: «Ник → [группа]» и клавиши; одна строка
+    let group = bracket_name(&text).or(gname);
+    let line = match (crate::groups::invite_from(), group) {
+        (Some(f), Some(g)) => format!("{f} → [{g}]"),
+        _ => invite_line(&text, None),
+    };
+    let hint = "Y ✔  N ✖";
+    let w = (text_width(&line) + text_width(hint) + 30).min((gw - 16).max(120));
+    let h = 14;
+    let (x, y) = (gw / 2 - w / 2, 4);
+    // появляется и гаснет плавно
+    let a = ((age / 0.02).min(1.0) * ((1.0 - age) / 0.05).min(1.0)).clamp(0.0, 1.0);
+    let k = |argb: u32| mul_alpha(argb, a);
+    rounded(c, x, y, w, h, k(0xB014_0A20));
+    draw_icon_fx(c, &icons::TAB_GROUPS, x + 4, y + 3, 1, Fx { a, ..Fx::NONE });
+    c.text(&fit(&line, w - text_width(hint) - 26), x + 16, y + 3, TEXT, true);
+    c.text(hint, x + w - text_width(hint) - 5, y + 3, 0xC7_9BFF, true);
+    // сколько осталось
+    let left = ((1.0 - age) * (w - 4) as f32).round() as i32;
+    c.fill(x + 2, y + h - 1, left.max(0), 1, k(0x90A8_55F7));
+}
+
+/// Громкость игрока после ПКМ + колесо: маленькая фиолетовая плашка над его ником (`tag` — верх его тега
+/// на экране), а если игрока не видно — под прицелом, с ником.
+pub fn draw_volume_toast(c: &mut dyn Canvas, gw: i32, gh: i32, tag: Option<(i32, i32)>) {
     let Some((nick, pct, alpha)) = S::volume_toast() else { return };
-    let a = ((alpha.clamp(0.0, 1.0) * 255.0) as u32).max(4);
-    let label = if pct == 0 { format!("{nick}: выкл") } else { format!("{nick}: {pct}%") };
-    let bar_w = 80;
-    let w = (text_width(&label) + 12).max(bar_w + 12);
-    let (x, y) = (gw / 2 - w / 2, gh / 2 + 18);
-    c.fill(x, y, w, 24, (a * 0x50 / 255) << 24);
-    let text_rgb = if pct > 100 { OVER } else if pct == 0 { ERR } else { TEXT };
-    c.text(&label, gw / 2 - text_width(&label) / 2, y + 3, text_rgb, true);
-    let bx = gw / 2 - bar_w / 2;
-    c.fill(bx, y + 15, bar_w, 4, (a << 24) | 0x24_2424);
-    let fw = (pct.min(200) as f32 / 200.0 * bar_w as f32) as i32;
-    c.fill(bx, y + 15, fw, 4, (a << 24) | if pct > 100 { 0xFF_AA00 } else { 0x8B_8B8B });
-    c.fill(bx + bar_w / 2, y + 14, 1, 6, (a << 24) | 0xFF_FFFF);
+    let a = alpha.clamp(0.0, 1.0);
+    let k = |argb: u32| mul_alpha(argb, a);
+    let value = if pct == 0 { crate::i18n::tr("выкл").to_string() } else { format!("{pct}%") };
+    let vcol = if pct == 0 { ERR } else if pct > 100 { 0xD9_A6FF } else { 0xC7_9BFF };
+    let label = match tag {
+        Some(_) => value.clone(),
+        None => format!("{nick} {value}"),
+    };
+    let w = text_width(&label).max(28) + 8;
+    let h = 15;
+    let (cx, top) = match tag {
+        Some((tx, ty)) => (tx, ty - h - 2),
+        None => (gw / 2, gh / 2 + 14),
+    };
+    let x = (cx - w / 2).clamp(2, (gw - w - 2).max(2));
+    let y = top.clamp(2, (gh - h - 2).max(2));
+    // полупрозрачная плашка, тонкая полоска громкости снизу (до 200%, отметка на 100%)
+    rounded_with(c, x, y, w, h, k(0x9014_0A20), &[1]);
+    c.text(&label, x + (w - text_width(&label)) / 2, y + 2, vcol, true);
+    let (bx, by, bw) = (x + 3, y + h - 3, w - 6);
+    c.fill(bx, by, bw, 1, k(0x40FF_FFFF));
+    let fill = (pct.min(200) as f32 / 200.0 * bw as f32).round() as i32;
+    c.fill(bx, by, fill, 1, k(if pct > 100 { RUST } else { P_ACC }));
+    c.fill(bx + bw / 2, by - 1, 1, 2, k(0xC0FF_FFFF));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coin_rings_and_flips_after_five_clicks() {
+        let _ = take_coin_sounds();
+        for _ in 0..4 {
+            coin_click();
+        }
+        assert!(COIN.lock().unwrap().flip_at.is_none(), "четыре щелчка — ещё не переворот");
+        coin_click();
+        assert!(COIN.lock().unwrap().flip_at.is_some(), "пятый подряд — переворот");
+        let sounds = take_coin_sounds();
+        assert_eq!(sounds.len(), 5);
+        assert!(sounds.windows(2).take(3).all(|p| p[1] > p[0]), "каждый следующий звон выше: {sounds:?}");
+        assert_eq!(sounds[4], 2.0);
+        let mut fx = Fx::NONE;
+        coin_fx(&mut fx);
+        assert!(fx.flip <= 1.0 && fx.dy <= 0.0);
+        // ещё три подряд (всего восемь) — благодарность
+        COIN.lock().unwrap().flip_at = None;
+        for _ in 0..3 {
+            coin_click();
+        }
+        assert!(COIN.lock().unwrap().thanks_at.is_some(), "восьмой щелчок — благодарность JeleCraft");
+        let _ = take_coin_sounds();
+    }
 
     #[derive(Default)]
     struct Rec {
@@ -2674,8 +3822,8 @@ mod tests {
         lock().gui_h = 240;
         let mut r = Rec::default();
         draw(&mut r, (0, 0));
-        assert!(r.texts.iter().any(|s| s == "Отключить устройство"), "{:?}", r.texts);
-        assert!(!r.texts.iter().any(|s| s == "HRTF"), "на маленьком экране низ страницы не виден");
+        assert!(r.texts.iter().any(|s| s == "Устройство ввода"), "{:?}", r.texts);
+        assert!(!r.texts.iter().any(|s| s == "Проверка звука"), "на маленьком экране низ страницы не виден");
         assert!(on_scroll(-50.0), "колесо на вкладке «Устройства» наше");
         for _ in 0..3 {
             let mut r = Rec::default();
@@ -2689,8 +3837,8 @@ mod tests {
         }
         let mut r = Rec::default();
         draw(&mut r, (0, 0));
-        assert!(r.texts.iter().any(|s| s == "HRTF"), "{:?}", r.texts);
-        assert!(r.texts.iter().any(|s| s == "Заглушение через блоки"));
+        assert!(r.texts.iter().any(|s| s == "Проверка звука"), "{:?}", r.texts);
+        assert!(r.texts.iter().any(|s| s == "Объёмный звук"));
         on_open();
         lock().tab = Tab::Devices;
     }
@@ -2736,6 +3884,38 @@ mod tests {
         let mut r = Rec::default();
         assert_eq!(talk_list(&mut r, &[], 0, 0, 400, 300, Some("Группа")), 0);
         assert!(r.texts.is_empty() && r.fills == 0, "пустая группа — ни заголовка, ни рамки");
+    }
+
+    #[test]
+    fn player_slider_follows_the_player_not_the_row() {
+        let a = player_slider_id("Alex");
+        assert_eq!(a, player_slider_id("Alex"), "тот же ник — тот же ползунок");
+        assert_eq!(a, player_slider_id("alex"), "ники в Minecraft без учёта регистра");
+        assert_ne!(a, player_slider_id("Steve"));
+        for n in ["", "a", "Notch", "очень_длинный_ник_игрока"] {
+            let id = player_slider_id(n);
+            assert!((PLAYER_SLIDER_BASE..PLAYER_SLIDER_BASE + PLAYER_SLIDER_SPAN).contains(&id));
+            assert!(id > 200 + 64, "не пересекается с ползунками дистанций");
+            assert!(id < 0xF_FFFF, "влезает в akey");
+        }
+    }
+
+    #[test]
+    fn scrolling_players_releases_a_held_player_slider() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        S::set_mic_picker(false);
+        on_open();
+        lock().tab = Tab::Players;
+        let mut r = Rec::default();
+        draw(&mut r, (0, 0));
+        lock().active = player_slider_id("Alex");
+        assert!(on_scroll(-1.0));
+        assert_eq!(lock().active, 0, "колесо отпускает ползунок игрока");
+        lock().active = SRC_LOCAL;
+        assert!(on_scroll(1.0));
+        assert_eq!(lock().active, SRC_LOCAL, "ползунки источников над списком не трогаем");
+        lock().active = 0;
+        lock().tab = Tab::Devices;
     }
 
     #[test]
@@ -2911,11 +4091,12 @@ mod tests {
     fn volume_toast_draws_only_while_fresh() {
         let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let mut r = Rec::default();
-        draw_volume_toast(&mut r, 427, 240);
+        draw_volume_toast(&mut r, 427, 240, None);
         let before = r.texts.len();
         S::show_volume_toast("Steve", 120);
-        draw_volume_toast(&mut r, 427, 240);
-        assert_eq!(r.texts.len(), before + 1);
-        assert!(r.texts.last().unwrap().contains("Steve"));
+        draw_volume_toast(&mut r, 427, 240, None);
+        assert_eq!(r.texts[before..], ["Steve 120%"], "игрока не видно — под прицелом с ником");
+        draw_volume_toast(&mut r, 427, 240, Some((100, 80)));
+        assert_eq!(r.texts.last().map(String::as_str), Some("120%"), "над ником — только громкость");
     }
 }
