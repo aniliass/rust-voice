@@ -571,6 +571,7 @@ pub struct Session {
 
 impl Session {
     /// Сессия 2.7 (id соединения из ключа).
+    #[cfg(test)]
     pub fn new(key: &[u8; 16], connection_id: [u8; 16]) -> Session {
         Session::with_version(key, connection_id, V27)
     }

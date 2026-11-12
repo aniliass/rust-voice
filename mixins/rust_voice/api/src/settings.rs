@@ -97,7 +97,6 @@ static VAD_AI: AtomicBool = AtomicBool::new(false);
 /// Вероятность речи в последнем кадре по нейросети (0..1, как биты f32) — для полосы в меню.
 static SPEECH: AtomicU32 = AtomicU32::new(0);
 static SPEAKING: AtomicBool = AtomicBool::new(false);
-static HEARING: AtomicU32 = AtomicU32::new(0);
 static CONNECTED: AtomicBool = AtomicBool::new(false);
 static MIC_OK: AtomicBool = AtomicBool::new(false);
 static DISTANCE: AtomicU32 = AtomicU32::new(0);
@@ -120,7 +119,6 @@ static NOTICE: Mutex<Option<(String, Instant)>> = Mutex::new(None);
 static PTT_BINDS: Mutex<[String; PTT_SLOTS]> = Mutex::new([const { String::new() }; PTT_SLOTS]);
 /// Проверка звука: микрофон играет в ваши динамики и не уходит на сервер. Не сохраняется, выключается с закрытием меню.
 static MIC_TEST: AtomicBool = AtomicBool::new(false);
-static PTT_KEY_LABEL: Mutex<String> = Mutex::new(String::new());
 /// Клавиша открытия меню в виде, который игрок видит (`M`): выбирается в Options > Mods, мод лишь читает её у игры.
 static MENU_KEY_LABEL: Mutex<String> = Mutex::new(String::new());
 
@@ -264,19 +262,6 @@ pub fn set_slot_binding(slot: usize, key: Option<&str>) {
         }
     }
     set_slot_held(slot, false);
-}
-pub fn ptt_key_label() -> String {
-    match PTT_KEY_LABEL.lock() {
-        Ok(l) if !l.is_empty() => l.clone(),
-        _ => ptt_label_for(PTT_KEY_DEFAULT),
-    }
-}
-pub fn set_ptt_key_label(v: &str) {
-    if let Ok(mut l) = PTT_KEY_LABEL.lock() {
-        if *l != v {
-            *l = v.to_string();
-        }
-    }
 }
 
 /// «Локальный» по клавише (рация), а не по голосу.
@@ -597,8 +582,6 @@ pub fn set_speech(v: f32) { SPEECH.store(v.to_bits(), Relaxed) }
 pub fn set_level(v: f32) { LEVEL.store(v.to_bits(), Relaxed) }
 pub fn speaking() -> bool { SPEAKING.load(Relaxed) }
 pub fn set_speaking(v: bool) { SPEAKING.store(v, Relaxed) }
-pub fn hearing() -> u32 { HEARING.load(Relaxed) }
-pub fn set_hearing(v: u32) { HEARING.store(v, Relaxed) }
 pub fn connected() -> bool { CONNECTED.load(Relaxed) }
 pub fn set_connected(v: bool) { CONNECTED.store(v, Relaxed) }
 pub fn mic_ok() -> bool { MIC_OK.load(Relaxed) }
@@ -808,6 +791,7 @@ pub fn player_volumes() -> Vec<(String, u32)> {
     v.sort();
     v
 }
+#[cfg(test)]
 pub fn clear_player_volumes() {
     if let Ok(mut g) = PLAYER_VOL.lock() {
         *g = None;
@@ -1111,7 +1095,6 @@ mod tests {
         assert_eq!(ptt_label_for("key.keyboard.semicolon"), "Ж (SEMICOLON)");
         assert_eq!(ptt_label_for("key.keyboard.left.alt"), "LEFT ALT");
         assert_eq!(ptt_label_for(UNBOUND_KEY), "");
-        assert_eq!(ptt_key_label(), "Я (Z)");
     }
 
     #[test]

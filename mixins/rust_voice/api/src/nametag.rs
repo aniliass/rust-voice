@@ -302,10 +302,6 @@ pub fn tag_top(host: &dyn Host, nick: &str, gui_w: f32, gui_h: f32) -> Option<(f
     Some((p.cx, p.bottom - p.h))
 }
 
-pub fn place(cam: &Cam, pos: [f64; 3], gui_w: f32, gui_h: f32) -> Option<Placed> {
-    place_sized(cam, pos, gui_w, gui_h, None)
-}
-
 /// То же, но с заданным размером значка (сглаженным): `None` — взять размер по расстоянию.
 pub fn place_sized(cam: &Cam, pos: [f64; 3], gui_w: f32, gui_h: f32, size: Option<f32>) -> Option<Placed> {
     let d = [pos[0] - cam.pos[0], pos[1] - cam.pos[1], pos[2] - cam.pos[2]];

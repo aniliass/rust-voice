@@ -149,18 +149,6 @@ def slash(g):
     return g
 
 
-def gone(g):
-    """Faded mic (player without a voice mod): everything grey, small cross in the corner."""
-    for row in g:
-        for i, c in enumerate(row):
-            if c:
-                row[i] = {W: M, L: M, M: D, D: D}.get(c, c)
-    for i in range(3):
-        put(g, 12 + i, 11 + i, L)
-        put(g, 14 - i, 11 + i, L)
-    return g
-
-
 def no_voice():
     """Player without a voice mod: grey "no" sign (circle with a slash), unlike the red-slashed mic and headphones."""
     g = blank()
@@ -369,15 +357,12 @@ def runs(g):
 def icons():
     yield "MIC", mic(), "Microphone. Capsule rows 1..=8 fill with purple while the player talks."
     yield "MIC_MUTED", slash(mic()), "Microphone off: red slash."
-    yield "MIC_GONE", gone(mic()), "Player without a voice mod: faded microphone with a cross."
     yield "NO_VOICE", no_voice(), "Above a nick: player without a voice mod (grey no-sign)."
     yield "MIC_MENU", mic(), "Microphone in the menu."
     yield "MIC_MENU_OFF", slash(mic()), "Microphone (activation) off in the menu."
-    yield "HEADPHONES", headphones(), "Headphones: the voice chat."
     yield "HEADPHONES_OFF", slash(headphones()), "Voice chat off (you hear nobody, and your microphone is off too)."
     yield "NOTE", note(), "Music and world sounds (discs from pv-addon-discs)."
     yield "SPK", speaker(), "Speaker."
-    yield "SPK_OFF", slash(speaker()), "Sound off: red slash."
     yield "SPK_MENU", speaker(), "Player volume in the menu."
     yield "SPK_MENU_OFF", slash(speaker()), "Player muted in the menu."
     yield "SPK_GROUP", group_speaker(), "Group voice (volume row in the menu)."
@@ -387,7 +372,8 @@ def icons():
     for name, rows in TAB_ROWS.items():
         g = grid(rows, KEY)
         yield f"TAB_{name}", g, None
-        yield f"TAB_{name}_OFF", dim(g), None
+        if name != "LOCK":  # замок не гаснет: вкладка-замок всегда активна
+            yield f"TAB_{name}_OFF", dim(g), None
 
 
 def rust():

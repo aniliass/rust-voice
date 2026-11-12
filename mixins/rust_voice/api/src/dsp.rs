@@ -79,6 +79,7 @@ impl Agc {
         Agc { gain: 1.0 }
     }
 
+    #[cfg(test)]
     pub fn gain(&self) -> f32 {
         self.gain
     }

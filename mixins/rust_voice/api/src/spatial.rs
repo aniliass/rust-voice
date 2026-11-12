@@ -312,11 +312,6 @@ pub fn update(host: &dyn Host) {
     }
 }
 
-/// Сколько игроков сейчас слышно в обход стен (для вкладки «Продвинутые»).
-pub fn routed_count() -> usize {
-    MAP.lock().ok().and_then(|g| g.as_ref().map(|m| m.values().filter(|e| e.route.is_some() && e.at.elapsed() < STALE).count())).unwrap_or(0)
-}
-
 /// Как сейчас звучит игрок `nick`, если голос слышен до `max_dist` блоков. None — его нет рядом
 /// (или он далеко за краем прогрузки): тогда голос играет как есть, по центру.
 pub fn params(nick: &str, max_dist: f32) -> Option<Params> {

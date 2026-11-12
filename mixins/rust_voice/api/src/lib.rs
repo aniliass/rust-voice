@@ -514,9 +514,6 @@ impl Hooks for Mod {
         settings::set_menu_key_label(&settings::ptt_label_for(&menu_key(&*host)));
         for slot in 0..settings::PTT_SLOTS {
             let label = settings::ptt_label_for(&ptt_key(&*host, slot));
-            if slot == 0 {
-                settings::set_ptt_key_label(&label);
-            }
             settings::set_slot_key_label(slot, &label);
         }
         settings::save_if_volumes_due();

@@ -5,10 +5,12 @@
 **Русский**
 
 - Своя клавиша рации у каждой активации сервера (до восьми: «Локальный» и ещё семь), а не только у первых трёх. Аддоны Plasmo вроде шёпота, приоритета или трансляций теперь можно включать отдельной клавишей. Первые три рации, как и раньше, есть в Options > Mods, остальные назначаются в меню мода, вкладка «Клавиши».
+- Убран неиспользуемый код: сборка проходит без предупреждений компилятора.
 
 **English**
 
 - Every server activation now gets its own push-to-talk key (up to eight: Local plus seven more), not just the first three. Plasmo add-ons such as whisper, priority or broadcast can be used with a separate key. The first three are still in Options > Mods; the rest are bound in the mod menu, Hotkeys tab.
+- Removed unused code: the build has no compiler warnings.
 
 ## 0.1.46
 

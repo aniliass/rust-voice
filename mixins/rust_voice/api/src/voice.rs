@@ -69,7 +69,6 @@ impl Drop for VoiceCtl {
         settings::set_connected(false);
         settings::set_speaking(false);
         settings::set_speaking_to(false, false);
-        settings::set_hearing(0);
     }
 }
 
@@ -728,8 +727,6 @@ fn mix_output(play: &Arc<Mutex<Queues>>, data: &mut [f32], channels: usize) {
             src.started = false;
         }
     }
-    // игрока, которого вы заглушили до 0% (им самим или «Локальным»), «слышно» не считаем
-    settings::set_hearing(qs.by_source.values().filter(|e| e.started && e.effective_gain(vol) > 0.0).count() as u32);
     drop(qs);
     for v in data.iter_mut() {
         *v = if off { 0.0 } else { dsp::soft_limit(*v).clamp(-1.0, 1.0) };

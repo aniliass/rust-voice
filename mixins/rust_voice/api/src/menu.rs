@@ -303,7 +303,6 @@ pub fn on_scroll(dy: f32) -> bool {
             }
             true
         }
-        _ => false,
     }
 }
 
@@ -803,8 +802,7 @@ struct Ui<'a> {
     active: u32,
     changed: bool,
     tip: Option<String>,
-    /// Размер GUI, чтобы страница знала, сколько строк игроков помещается.
-    gw: i32,
+    /// Высота GUI, чтобы страница знала, сколько строк игроков помещается.
     gh: i32,
     /// Мигающая «_» в поле поиска: видна первую половину каждой секунды.
     blink: bool,
@@ -3213,7 +3211,6 @@ pub fn draw(c: &mut dyn Canvas, mouse: (i32, i32)) {
         active,
         changed: false,
         tip: None,
-        gw,
         gh,
         blink,
         dt,

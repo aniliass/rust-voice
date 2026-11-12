@@ -123,8 +123,6 @@ pub fn tcp_name(id: u8) -> &'static str {
 
 pub struct ConnectionInfo {
     pub secret: [u8; 16],
-    /// 16 байт секрета в hex (для логов: это ключ UDP-сессии, не публикуй).
-    pub secret_hex: String,
     pub ip: String,
     pub port: i32,
 }
@@ -149,7 +147,6 @@ pub fn parse_connection(body: &[u8]) -> Option<ConnectionInfo> {
     raw.copy_from_slice(secret);
     Some(ConnectionInfo {
         secret: raw,
-        secret_hex: secret.iter().map(|b| format!("{b:02x}")).collect(),
         ip,
         port,
     })
@@ -601,6 +598,8 @@ pub struct SourceAudio {
     pub seq: i64,
     pub data: Vec<u8>,
     pub source_id: [u8; 16],
+    /// Поле протокола Plasmo (состояние источника). Читаем, чтобы не сбить разбор, но пока не используем.
+    #[allow(dead_code)]
     pub state: u8,
     pub distance: i16,
 }
@@ -635,17 +634,6 @@ pub fn player_audio_end(seq: i64, activation: &[u8; 16], distance: i16) -> Vec<u
     out.extend_from_slice(activation);
     out.extend_from_slice(&distance.to_be_bytes());
     out
-}
-
-/// Название UDP-пакета по номеру (для логов).
-pub fn udp_name(ty: u8) -> &'static str {
-    match ty {
-        1 => "Ping",
-        2 => "PlayerAudio",
-        3 => "SourceAudio",
-        4 => "SelfAudioInfo",
-        _ => "?",
-    }
 }
 
 pub fn hex_prefix(data: &[u8], max: usize) -> String {
@@ -953,7 +941,7 @@ mod tests {
         let c = parse_connection(&b).unwrap();
         assert_eq!(c.ip, "127.0.0.1");
         assert_eq!(c.port, 25565);
-        assert_eq!(c.secret_hex.len(), 32);
+        assert_eq!(c.secret.len(), 16);
         assert!(parse_connection(&b[..10]).is_none());
     }
 

@@ -103,6 +103,7 @@ impl RsaKey {
         }
     }
 
+    #[cfg(test)]
     pub fn from_nd(n: &[u8], d: &[u8]) -> RsaKey {
         RsaKey { n: BigUint::from_bytes_be(n), e: BigUint::from(65537u32), d: BigUint::from_bytes_be(d) }
     }
@@ -138,9 +139,11 @@ impl RsaKey {
         Some(em[sep + 1..].to_vec())
     }
 
+    #[cfg(test)]
     pub fn n_bytes(&self) -> Vec<u8> {
         self.n.to_bytes_be()
     }
+    #[cfg(test)]
     pub fn d_bytes(&self) -> Vec<u8> {
         self.d.to_bytes_be()
     }
