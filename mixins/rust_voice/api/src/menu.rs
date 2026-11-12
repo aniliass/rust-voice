@@ -2623,15 +2623,16 @@ fn page_controls(ui: &mut Ui, x: i32, y: i32, w: i32) {
     let acts = S::server_activations();
     let mut hidden = false;
     for slot in 0..S::PTT_SLOTS {
-        // подпись: какая активация сейчас на этом слоте. Лишние рации (на сервере нет второй и третьей
-        // активации, например «Группы») не показываем: их клавиши ничего бы не делали.
+        // подпись: какая активация сейчас на этом слоте. Лишние рации (активаций на сервере меньше,
+        // чем слотов) не показываем: их клавиши ничего бы не делали.
         let name = if slot == 0 {
             Some("Локальный".to_string())
         } else {
             acts.iter().filter(|a| a.name != S::PROXIMITY).nth(slot - 1).map(activation_title)
         };
         let Some(n) = name else {
-            hidden = true;
+            // подсказку показываем, только если не хватает первых раций (как раньше), а не на каждом сервере
+            hidden |= slot < S::PTT_SLOTS_IN_OPTIONS;
             continue;
         };
         if ui.vis(ry, 20) {

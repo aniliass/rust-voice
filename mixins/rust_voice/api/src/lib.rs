@@ -369,9 +369,13 @@ fn run_action(action: &str) {
 }
 
 /// Клавиша рации слота: назначенная в меню мода, иначе выбранная в Options > Mods, иначе по умолчанию.
+/// Рации дальше третьей есть только в меню мода, в Options > Mods их нет.
 fn ptt_key(host: &dyn Host, slot: usize) -> String {
     if let Some(k) = settings::slot_binding(slot) {
         return k;
+    }
+    if slot >= settings::PTT_SLOTS_IN_OPTIONS {
+        return settings::UNBOUND_KEY.to_string();
     }
     let default = if slot == 0 { settings::PTT_KEY_DEFAULT } else { settings::UNBOUND_KEY };
     host.mod_key(MOD_ID, settings::PTT_SLOT_KEYS[slot], default)

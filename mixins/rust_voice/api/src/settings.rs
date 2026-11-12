@@ -107,7 +107,7 @@ static ACT_PREFS: Mutex<Option<HashMap<String, ActPref>>> = Mutex::new(None);
 /// Выбранные дистанции надо сообщить серверу (PlayerActivationDistances).
 static ACT_DIST_DIRTY: AtomicBool = AtomicBool::new(false);
 /// Клавиша рации сейчас зажата (пишет хук key в lib.rs, читает голосовой поток).
-/// Клавиши рации зажаты: слот 0 — «Локальный», 1 и 2 — следующие активации по весу.
+/// Клавиши рации зажаты: слот 0 — «Локальный», дальше — остальные активации сервера по весу.
 static PTT_HELD: [AtomicBool; PTT_SLOTS] = [const { AtomicBool::new(false) }; PTT_SLOTS];
 static PTT_LABELS: Mutex<[String; PTT_SLOTS]> = Mutex::new([const { String::new() }; PTT_SLOTS]);
 /// Клавиши действий, назначенные в меню (вкладка «Клавиши»): действие -> имя клавиши (`UNBOUND_KEY` — убрана).
@@ -614,10 +614,23 @@ pub fn set_distance(v: u32) { DISTANCE.store(v, Relaxed) }
 
 // ---------- активации ----------
 pub const PROXIMITY: &str = "proximity";
-/// Сколько клавиш рации: «Локальный» и ещё две активации.
-pub const PTT_SLOTS: usize = 3;
-/// Имена клавиш рации в Options > Mods для слотов 1 и 2 (слот 0 — `PTT_KEY_NAME`). Не назначены.
-pub const PTT_SLOT_KEYS: [&str; PTT_SLOTS] = [PTT_KEY_NAME, "push_to_talk_2", "push_to_talk_3"];
+/// Сколько клавиш рации: «Локальный» и ещё семь активаций. Аддоны Plasmo (группы, шёпот, приоритет,
+/// трансляция…) добавляют свои активации, и у каждой должна быть своя клавиша, как в Java-версии.
+pub const PTT_SLOTS: usize = 8;
+/// Сколько первых раций видно и в Options > Mods. Остальные назначаются только в меню мода:
+/// восемь строк в списке модов игры — это лишнее для большинства серверов.
+pub const PTT_SLOTS_IN_OPTIONS: usize = 3;
+/// Имена клавиш рации (слот 0 — `PTT_KEY_NAME`). По умолчанию не назначены.
+pub const PTT_SLOT_KEYS: [&str; PTT_SLOTS] = [
+    PTT_KEY_NAME,
+    "push_to_talk_2",
+    "push_to_talk_3",
+    "push_to_talk_4",
+    "push_to_talk_5",
+    "push_to_talk_6",
+    "push_to_talk_7",
+    "push_to_talk_8",
+];
 pub const UNBOUND_KEY: &str = "key.keyboard.unknown";
 
 /// Когда активация передаёт голос.
@@ -730,7 +743,7 @@ pub fn act_distance(a: &crate::plasmo::Activation) -> i32 {
 /// Пора ли сообщить серверу выбранные дистанции.
 pub fn take_distances_dirty() -> bool { ACT_DIST_DIRTY.swap(false, Relaxed) }
 
-/// Какой слот клавиши рации у активации: «Локальный» — 0, остальные по порядку — 1, 2; None — клавиш не хватило.
+/// Какой слот клавиши рации у активации: «Локальный» — 0, остальные по порядку — 1, 2, 3…; None — клавиш не хватило.
 pub fn ptt_slot(name: &str) -> Option<usize> {
     ptt_slot_in(&server_activations(), name)
 }
@@ -1127,9 +1140,10 @@ mod tests {
         set_server_activations(vec![act(PROXIMITY, 1), act("groups", 5), act("party", 3), act("extra", 2)]);
         let names: Vec<String> = server_activations().into_iter().map(|a| a.name).collect();
         assert_eq!(names, ["groups", "party", "extra", PROXIMITY], "по весу");
+        assert_eq!(ptt_slot("extra"), Some(3), "третьей активации тоже нужна своя клавиша");
         assert_eq!(act_pref(PROXIMITY).kind, ActKind::Voice);
         assert_eq!(act_pref("groups").kind, ActKind::Ptt, "остальные по клавише, как в Plasmo");
-        assert_eq!((ptt_slot(PROXIMITY), ptt_slot("groups"), ptt_slot("party"), ptt_slot("extra")), (Some(0), Some(1), Some(2), None));
+        assert_eq!((ptt_slot(PROXIMITY), ptt_slot("groups"), ptt_slot("party"), ptt_slot("extra")), (Some(0), Some(1), Some(2), Some(3)));
         assert!(take_distances_dirty());
         set_act_pref(PROXIMITY, ActPref { distance: Some(32), ..act_pref(PROXIMITY) });
         assert!(take_distances_dirty(), "дистанцию надо сообщить серверу");
@@ -1140,6 +1154,33 @@ mod tests {
         assert_eq!(act_pref(PROXIMITY).kind, ActKind::Ptt, "«Локальный» не наследует сам себя");
         set_act_pref(PROXIMITY, default_pref(PROXIMITY));
         reset_activations();
+    }
+
+    #[test]
+    fn every_server_activation_gets_its_own_ptt_key() {
+        use crate::plasmo::Activation;
+        let act = |name: String, weight: i32| Activation {
+            name: name.clone(),
+            translation: String::new(),
+            id: crate::plasmo::activation_id(&name),
+            distances: vec![],
+            default_distance: 0,
+            proximity: name == PROXIMITY,
+            transitive: false,
+            stereo: false,
+            weight,
+        };
+        // «Локальный» и восемь активаций аддонов: семь получают клавиши 1..7, на восьмую слотов нет
+        let mut acts = vec![act(PROXIMITY.to_string(), 100)];
+        acts.extend((0..8).map(|i| act(format!("addon{i}"), 50 - i)));
+        let slots: Vec<Option<usize>> = (0..8).map(|i| ptt_slot_in(&acts, &format!("addon{i}"))).collect();
+        assert_eq!(slots, [Some(1), Some(2), Some(3), Some(4), Some(5), Some(6), Some(7), None]);
+        assert_eq!(ptt_slot_in(&acts, PROXIMITY), Some(0));
+        let mut keys = PTT_SLOT_KEYS.to_vec();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), PTT_SLOTS, "имена клавиш не повторяются");
+        assert!(PTT_SLOTS_IN_OPTIONS <= PTT_SLOTS);
     }
 
     #[test]
